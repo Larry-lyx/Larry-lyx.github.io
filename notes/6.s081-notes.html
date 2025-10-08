@@ -213,7 +213,7 @@
       
 <h1 id="lec1">LEC1 </h1>
 <h2 id="进程和内核">进程和内核 </h2>
-<p><img src="..\assets\images\s.6081\image.png" alt="alt text"><br>
+<p><img src="..\assets\images\6.s081\image.png" alt="alt text"><br>
 这张图表明，用户所写的程序，也叫做进程process都只在用户空间中，无法直接调用CPU，内存，硬盘等；能够直接访问到硬件的称作内核kernel。所有进程都需要依靠内核提供帮助才能实现，调用内核提供的服务的调用叫做system call。</p>
 <p>PID：操作系统会为每个process分配一个编号，是一个正整数。PID是唯一的，同一时刻不会有两个进程有相同的PID。</p>
 <h2 id="系统调用">系统调用 </h2>
@@ -910,13 +910,13 @@ arr<span class="token punctuation">[</span><span class="token number">2</span><s
 <p>宏内核（Monolithic Kernel）：操作系统都在内核中，所有system call都以管理模式运行，不必考虑哪一部分不需要完全的硬件特权。<br>
 宏内核的缺点是，所有操作系统的子系统都被封在内核中，它们之间的互相调用很复杂。并且一旦出错的话，整个内核都运行不了，计算机就会停止工作。</p>
 <p>微内核（Microkernel）：最大限度减少管理模式下运行的操作系统代码量，并在用户模式下执行大部分操作系统，如下图所示，应用程序shell通过向同样处在用户空间的文件系统发送消息实现文件的读写：<br>
-<img src="..\assets\images\s.6081\image-1.png" alt="alt text"></p>
+<img src="..\assets\images\6.s081\image-1.png" alt="alt text"></p>
 <p>大多数操作系统是用宏内核实现的，包括Unix,以及课程实验中的xv6。</p>
 <h2 id="进程">进程 </h2>
 <p>进程：隔离的单元，不能访问其他进程的内存、CPU、文件描述符，不能破坏内核。<br>
 进程给程序一种错觉，即它有自己的地址空间（其他进程不能用这个地址空间），也有自己的CPU来执行命令。</p>
 <p>进程的地址空间分配如下：<br>
-<img src="..\assets\images\s.6081\image-2.png" alt="alt text"><br>
+<img src="..\assets\images\6.s081\image-2.png" alt="alt text"><br>
 user text and data:存放用户程序的可执行指令和全局变量；<br>
 user stack：用户栈，调用函数时存放局部变量、返回地址等临时消息；<br>
 heap：存放运行时动态申请的内存；<br>
@@ -1143,7 +1143,7 @@ sinfo<span class="token punctuation">.</span>nproc <span class="token operator">
 因此页表有<span class="katex"><span class="katex-mathml"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msup><mn>2</mn><mn>2</mn></msup><mn>7</mn></mrow><annotation encoding="application/x-tex">2^27</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord"><span class="mord">2</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span><span class="mord">7</span></span></span></span>项，每一项对应虚拟地址中39位的前27位中的1个，即1个PTE；<br>
 每个PTE有54位，其中前44位就是每个PTE对应的物理地址的前44位，称为PPN，后10位是标志位flag；<br>
 实际情况下，用8个字节（64位）来存储一个PTE，因此页表相当于一个数组uint64 a[1&lt;&lt;27]，它所占据的内存大小是1GB;<br>
-<img src="..\assets\images\s.6081\image-3.png" alt="alt text"><br>
+<img src="..\assets\images\6.s081\image-3.png" alt="alt text"><br>
 用1GB来存储一个进程的页表显然是不可接受的，实际使用三级页表的方式来优化存储：<br>
 首先我们有一个44位的起始地址d，地址以1个字节为单位，它被预先存储在每个CPU的<code>satp</code>中；<br>
 我们获取27位中的前9位，它对应十进制的a1；<br>
@@ -1153,13 +1153,13 @@ sinfo<span class="token punctuation">.</span>nproc <span class="token operator">
 获取27位中的最后9位，它对应十进制的a3;<br>
 我们可以得到地址<span class="katex"><span class="katex-mathml"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>d</mi><mn>2</mn><mo>+</mo><mi>a</mi><mn>3</mn><mo>×</mo><mn>8</mn></mrow><annotation encoding="application/x-tex">d2+a3\times8</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7778em;vertical-align:-0.0833em;"></span><span class="mord mathnormal">d</span><span class="mord">2</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord mathnormal">a</span><span class="mord">3</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">8</span></span></span></span>开始的8个字节，这就是我们最后所需要的那8个字节；<br>
 具体图示如下：<br>
-<img src="..\assets\images\s.6081\image-4.png" alt="alt text"><br>
+<img src="..\assets\images\6.s081\image-4.png" alt="alt text"><br>
 为什么这么做能节省内存？<br>
 原则上，如果我们能够预知虚拟内存中有多少页需要被使用，只为那些被使用的页分配内存是最节约的；<br>
 然而实际上，我们在分配内存时，并不知道有多少页需要被使用，为了不引发错误，必须使用足够多的空间；<br>
 三级页表提供了一种“按需分配”的方法，只有当a1被使用时，a1所对应的d1起始的内存才需要被关注，否则我们无需关心d1起始的内存里面存了什么东西；<br>
 因此，只有d起始的那些内存是一开始必须要写好的，其余部分都是a1a2a3中声明了哪些，才存哪些；<br>
-<img src="..\assets\images\s.6081\image-5.png" alt="alt text"><br>
+<img src="..\assets\images\6.s081\image-5.png" alt="alt text"><br>
 我们知道每个PTE中对应的是一个64位数，其中的后10位是标志位，用来告诉硬件如何使用关联的虚拟地址；<br>
 PTE_V指示是否存在该PTE；<br>
 PTE_R控制是由允许读取页面；<br>
@@ -1180,7 +1180,7 @@ PTE_U控制是否允许用户模式下访问，如果未设置，只能在管理
 <p>内核空间的页表有一套固定的规则，物理地址中哪些被内核所占用是确定的；<br>
 而进程的用户页表是内核交给它的，只有通过内核分配的用户页表，每个进程才知道自己的用户空间地址对应于哪一部分物理地址；</p>
 <p>内核空间的页表的映射关系如下：<br>
-<img src="..\assets\images\s.6081\image-6.png" alt="alt text"><br>
+<img src="..\assets\images\6.s081\image-6.png" alt="alt text"><br>
 内核虚拟地址右侧的R,X,W表明是否具备读、执行、写权限；</p>
 <p>大部分虚拟地址映射到物理内存（RAM）中，但是也有少部分KERNBASE以下的映射；<br>
 这些映射表明，内核并不是与RAM交互，而是直接与下面的硬件设备交互的；</p>
@@ -1243,7 +1243,7 @@ kvm开头的函数与内核虚拟地址相关，uvm开头的函数与用户虚�
 <p><code>kinit</code>:调用<code>freearange</code>确保释放的物理地址是对齐的，并为每一页调用<code>kfree</code>;</p>
 <p><code>kalloc</code>:删除并返回空闲链表的表头；</p>
 <h2 id="进程地址空间">进程地址空间 </h2>
-<p><img src="..\assets\images\s.6081\image-7.png" alt="alt text"><br>
+<p><img src="..\assets\images\6.s081\image-7.png" alt="alt text"><br>
 heap中的虚拟地址的使用范围是可以被扩大或缩小的；<br>
 进程索要内存，指的就是扩大heap中虚拟地址的使用，为其分配物理空间；</p>
 <p>用户栈中存储的是这个进程执行的那些命令；<br>
@@ -1633,7 +1633,7 @@ sz <span class="token operator">=</span> <span class="token function">uvmdealloc
 RISC-V的指令数量显著少于x86；<br>
 RISC-V的指令的复杂度更低；</p>
 <h2 id="risc-v寄存器">RISC-V寄存器 </h2>
-<p><img src="..\assets\images\s.6081\image-8.png" alt="alt text"><br>
+<p><img src="..\assets\images\6.s081\image-8.png" alt="alt text"><br>
 汇编代码不是在内存上执行，而是在寄存器上执行；<br>
 引用寄存器时，使用它的ABI名字；</p>
 <p>a0-a7寄存器存储函数的参数，一个函数如果有超过8个参数，就需要使用内存；</p>
@@ -1646,11 +1646,11 @@ RISC-V的指令的复杂度更低；</p>
 <h2 id="栈">栈 </h2>
 <p>每调用一个函数，函数会创建一个栈给自己用；<br>
 通过栈的指针来完成空间分配，栈总是向下增长，因此分配空间是栈指针做减法；<br>
-<img src="..\assets\images\s.6081\image-9.png" alt="alt text"></p>
+<img src="..\assets\images\6.s081\image-9.png" alt="alt text"></p>
 <p>栈中最开始会存储返回地址，也就是函数执行完之后的下一个指令地址；<br>
 并在固定位置存储指向前一个栈的地址，这是为了能够使用前一个函数中的局部变量和参数；</p>
 <p>在汇编代码中，函数总是先有序言prologue，然后是函数体，最后是尾声epilogue:<br>
-<img src="..\assets\images\s.6081\image-10.png" alt="alt text"><br>
+<img src="..\assets\images\6.s081\image-10.png" alt="alt text"><br>
 在sum_then_double函数中，先进行的是移动指针sp -= 16;<br>
 这是为了给当前步的存储预留空间；<br>
 标准是16字节,但是实际上我们这里只存了ra中保存的返回地址的8字节，并没有存前一个栈的地址；<br>
@@ -1921,7 +1921,7 @@ p<span class="token operator">-&gt;</span>in_handler <span class="token operator
 引起page fault的程序计数器的值；</p>
 <h2 id="lazy-allocation">lazy allocation </h2>
 <p>先来看sbrk函数：<br>
-<img src="..\assets\images\s.6081\image-11.png" alt="alt text"><br>
+<img src="..\assets\images\6.s081\image-11.png" alt="alt text"><br>
 p-&gt;sz本身指向栈的顶端，同时也是堆的底端；<br>
 sbrk函数接受一个整数，表示想要向上扩展堆的页数（也可以是负数）；<br>
 一旦调用sbrk，系统会立即分配需要的物理内存，再进行映射；<br>
@@ -2531,7 +2531,7 @@ swtch函数所做的主要事情就是，把当前寄存器写入第一个参数
 <p>注意这里并不需要保持所有的寄存器，因为swtch函数是C代码调用的，而caller saved寄存器会被C编译器保存在当前的栈上，因此只需要保存callee寄存器即可；</p>
 <p>完成这些之后，实际上已经处于调度器线程的swtch函数的返回状态了，这是因为上一次从调度器线程出去就是在swtch函数中；<br>
 返回之后，我们会进入函数scheduler中；<br>
-<img src="..\assets\images\s.6081\image-12.png" alt="alt text"><br>
+<img src="..\assets\images\6.s081\image-12.png" alt="alt text"><br>
 注意，这里的进入scheduler函数并不是进入scheduler函数的出发点；<br>
 而是进入scheduler函数中swtch函数的返回状态；<br>
 注意，我们获得了进程的锁之后，并没有关闭锁；<br>
