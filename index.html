@@ -390,6 +390,32 @@
       transform: translateY(-2px);
     }
 
+    /* PDF笔记特殊样式 */
+    .pdf-note .note-header {
+      position: relative;
+    }
+
+    .pdf-note .note-header::after {
+      content: "PDF";
+      position: absolute;
+      top: 15px;
+      right: 15px;
+      background: rgba(255, 255, 255, 0.25);
+      padding: 3px 10px;
+      border-radius: 12px;
+      font-size: 0.8rem;
+      font-weight: bold;
+      backdrop-filter: blur(2px);
+    }
+
+    .pdf-link {
+      background: linear-gradient(135deg, #e63946, #d90429);
+    }
+
+    .pdf-link:hover {
+      background: linear-gradient(135deg, #d00000, #9d0208);
+}
+
     /* 页脚样式 */
     footer {
       background: var(--card-bg);
@@ -640,7 +666,7 @@
     </div>
 
     <!-- 笔记列表 -->
-    <h2>所有笔记</h2>
+    <h2>计算机</h2>
     <div class="notes-grid">
       <!-- 笔记卡片 1 -->
       <div class="note-card">
@@ -705,6 +731,136 @@
         </div>
       </div>
     </div>
+
+    <h2>物理</h2>
+    <div class="notes-grid">
+      <!-- PDF笔记卡片 1 -->
+      <div class="note-card pdf-note">
+        <div class="note-header" >
+          <span class="note-tag">PDF笔记</span>
+          <h3 class="note-title">理论力学 学习笔记</h3>
+          <div class="note-date">
+            <i class="far fa-calendar"></i> 2024-01
+          </div>
+        </div>
+        <div class="note-body">
+          <p class="note-description">拉格朗日力学、哈密顿力学、最小作用量原理、刚体动力学、小振动理论与正则变换等核心内容系统讲解，包含经典力学问题的现代分析方法与实际应用案例。</p>
+          <div class="note-footer">
+            <div class="note-stats">
+            </div>
+            <a href="notes/理论力学讲义.pdf" class="note-link pdf-link" download>
+              下载PDF <i class="fas fa-download"></i>
+            </a>
+          </div>
+        </div>
+      </div>
+
+      <!-- PDF笔记卡片 2 -->
+      <div class="note-card pdf-note">
+        <div class="note-header" style="background: linear-gradient(135deg, #d62828, #9d0208);">
+          <span class="note-tag">PDF笔记</span>
+          <h3 class="note-title">电动力学 学习笔记</h3>
+          <div class="note-date">
+            <i class="far fa-calendar"></i> 2025-01
+          </div>
+        </div>
+        <div class="note-body">
+          <p class="note-description">麦克斯韦方程组、电磁波传播理论、辐射与散射、相对论电动力学及边界值问题求解方法详解。</p>
+          <div class="note-footer">
+            <div class="note-stats">
+            </div>
+            <a href="notes/电动力学讲义.pdf" class="note-link pdf-link" download>
+              下载PDF <i class="fas fa-download"></i>
+            </a>
+          </div>
+        </div>
+      </div>
+
+      <!-- PDF笔记卡片 3 -->
+      <div class="note-card pdf-note">
+        <div class="note-header" style="background: linear-gradient(135deg, #5e60ce, #3a0ca3);">
+          <span class="note-tag">PDF笔记</span>
+          <h3 class="note-title">量子力学 学习笔记</h3>
+          <div class="note-date">
+            <i class="far fa-calendar"></i> 2025-01
+          </div>
+        </div>
+        <div class="note-body">
+          <p class="note-description">波函数与薛定谔方程、角动量理论、全同粒子、微扰论与变分法、散射理论等核心概念系统解析，涵盖原子物理与固体物理中的典型应用案例。</p>
+          <div class="note-footer">
+            <div class="note-stats">
+            </div>
+            <a href="notes/量子力学讲义.pdf" class="note-link pdf-link" download>
+              下载PDF <i class="fas fa-download"></i>
+            </a>
+          </div>
+        </div>
+      </div>
+
+      <!-- PDF笔记卡片 4 -->
+      <div class="note-card pdf-note">
+        <div class="note-header" >
+          <span class="note-tag">PDF笔记</span>
+          <h3 class="note-title">平衡态统计力学 学习笔记</h3>
+          <div class="note-date">
+            <i class="far fa-calendar"></i> 2025-06
+          </div>
+        </div>
+        <div class="note-body">
+          <p class="note-description">微观态与宏观态关系、系综理论、相空间分析、配分函数计算、相变理论深入讲解，结合凝聚态物理与热力学现象的实际应用分析。</p>
+          <div class="note-footer">
+            <div class="note-stats">
+            </div>
+            <a href="notes/平统讲义.pdf" class="note-link pdf-link" download>
+              下载PDF <i class="fas fa-download"></i>
+            </a>
+          </div>
+        </div>
+      </div>
+
+      <!-- PDF笔记卡片 5 -->
+      <div class="note-card pdf-note">
+        <div class="note-header" style="background: linear-gradient(135deg, #d62828, #9d0208);">
+          <span class="note-tag">PDF笔记</span>
+          <h3 class="note-title">数学物理方法（上） 学习笔记</h3>
+          <div class="note-date">
+            <i class="far fa-calendar"></i> 2024-06
+          </div>
+        </div>
+        <div class="note-body">
+          <p class="note-description">复变函数理论、解析函数性质、留数定理应用、保角变换技巧与傅里叶变换方法详解，包含电磁学与量子力学问题中的典型数学处理实例。</p>
+          <div class="note-footer">
+            <div class="note-stats">
+            </div>
+            <a href="notes/数学物理方法讲义（上）.pdf" class="note-link pdf-link" download>
+              下载PDF <i class="fas fa-download"></i>
+            </a>
+          </div>
+        </div>
+      </div>
+
+      <!-- PDF笔记卡片 6 -->
+      <div class="note-card pdf-note">
+        <div class="note-header" style="background: linear-gradient(135deg, #5e60ce, #3a0ca3);">
+          <span class="note-tag">PDF笔记</span>
+          <h3 class="note-title">数学物理方法（下） 学习笔记</h3>
+          <div class="note-date">
+            <i class="far fa-calendar"></i> 2025-01
+          </div>
+        </div>
+        <div class="note-body">
+          <p class="note-description">偏微分方程求解技术、特殊函数(贝塞尔函数、勒让德多项式等)、格林函数方法、变分原理系统讲解，结合量子力学的高级应用案例。</p>
+          <div class="note-footer">
+            <div class="note-stats">
+            </div>
+            <a href="notes/数学物理方法讲义（下）.pdf" class="note-link pdf-link" download>
+              下载PDF <i class="fas fa-download"></i>
+            </a>
+          </div>
+        </div>
+      </div>
+
+    </div>
   </main>
 
   <!-- 页脚 -->
@@ -727,6 +883,9 @@
             <li><a href="#"><i class="fas fa-chevron-right"></i> 人工智能导论</a></li>
             <li><a href="#"><i class="fas fa-chevron-right"></i> 深度学习</a></li>
             <li><a href="#"><i class="fas fa-chevron-right"></i> 操作系统原理</a></li>
+            <li><a href="#"><i class="fas fa-chevron-right"></i> 电动力学</a></li>
+            <li><a href="#"><i class="fas fa-chevron-right"></i> 量子力学</a></li>
+            <li><a href="#"><i class="fas fa-chevron-right"></i> 数学物理方法</a></li>
           </ul>
         </div>
         
