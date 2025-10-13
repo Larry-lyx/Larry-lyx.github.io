@@ -210,6 +210,7 @@
 <body for="html-export">
   <div class="content-wrapper">
     <div class="crossnote markdown-preview">
+
       
 <h1 id="lec1">LEC1 </h1>
 <h2 id="进程和内核">进程和内核 </h2>
@@ -2695,6 +2696,1450 @@ t<span class="token operator">-&gt;</span>context<span class="token punctuation"
 <span class="token punctuation">}</span>
 </code></pre></details>
 <h1 id="lec11">LEC11 </h1>
+<h2 id="锁的限制">锁的限制 </h2>
+<p>在申请锁的过程中，会关闭中断，否则如果进入中断无法返回这个锁会导致死锁；<br>
+在swtch函数切换进程时，需要确保没有持有其他锁（在sched函数中检查），否则会导致A进程中其他的锁，因为CPU切换到其他进程而成为死锁；</p>
+<h2 id="coordination">Coordination </h2>
+<p>有些时候需要等待其他事件的发生进程才能继续运行（pipe），同时我们希望等待的时间CPU可以做其他事，直到等待的事件发生后再恢复执行；<br>
+实现coordination的方式是sleep&amp;wakeup；</p>
+<p>考虑uart驱动向buf中读写数据的过程：<br>
+必须要完成字符传输才能进行读写；<br>
+因此在uartwrite函数中，我们需要在标记tx_done为0的时候选择sleep，并停留；<br>
+当完成传输之后，会触发中断，在中断处理函数uartinitr中；<br>
+如果传输已经完成，会将tx_done置为1，并启用wakeup函数；<br>
+这时候wakeup会唤醒之前的sleep函数，进行下一个传输，并重新让tx_done为0，确保一次传输一个字符；<br>
+具体的代码流程如下：<br>
+<img src="..\assets\images\6.s081\image-13.png" alt="alt text"><br>
+<img src="..\assets\images\6.s081\image-14.png" alt="alt text"></p>
+<p>需要注意的是，sleep函数和wakeup函数需要配对使用；<br>
+它们通过传入相同参数sleep channel来进行匹配；</p>
+<h2 id="lost-wakeup">Lost wakeup </h2>
+<p>在以上过程中，锁是重要的，因为：<br>
+tx_done是公共的标志，需要用锁保护起来；<br>
+多个线程并发访问UART硬件的寄存器是不可接受的；</p>
+<p>uartintr中的锁是简单的，开始时申请，最后释放即可；<br>
+但是在uartwrite中，如果也在找到buf中的字符c之前申请锁，完成传输并且done归0后释放的话，会出问题；<br>
+因为退出while只能依靠其他进程修改掉done，然而done正在被锁住；</p>
+<p>因此，我们需要在sleep函数之前释放锁，并在sleep函数返回（被唤醒时）重新获取锁，这样能保证对于done的修改都在锁中，并且不会引发死锁；</p>
+<p>然而，简单地在sleep之前释放锁，并在sleep之后获取锁是不行的；<br>
+因为在释放锁和sleep之中可能完成传输，触发中断；<br>
+这会导致在当前CPU上还没有让进程开始sleep，另一个CPU已经发现传输完成并设定好done，调用wakeup了；<br>
+然而此时并没有任何sleep_channel进入睡眠，因此wakeup无法唤醒；<br>
+而在wakeup之后，uartwrite才进入sleep，而此时的sleep将无法被唤醒，因为wakeup已经被调用；</p>
+<h2 id="sleep--wakeup">sleep &amp; wakeup </h2>
+<p>要消灭以上的窗口期，我们需要在sleep函数内实现锁的释放和获取；<br>
+sleep函数的实现如下：<br>
+<img src="..\assets\images\6.s081\image-15.png" alt="alt text"><br>
+我们需要搭配wakeup函数一起来看：<br>
+<img src="..\assets\images\6.s081\image-16.png" alt="alt text"><br>
+wakeup函数要查询进程列表并修改进程状态，因此这个过程需要被进程锁包裹住；</p>
+<p>而在sleep函数中首先做的就是获取进程的锁；<br>
+注意此时done的锁（传入参数）还没有被释放，就算形成中断，也没法进入wakeup中，因为done还被锁着；<br>
+之后释放done的锁，此时就算另一个进程能够进入wakeup中，也访问不了当前准备sleep的进程，因为进程的锁被持有了；<br>
+于是我们可以放心地设置好sleep参数，并进入调度器sched中；</p>
+<p>注意在线程切换时，调度器会在线程切走时释放掉前一个线程的锁，因此直到该进程被切换掉，另一边的wakeup函数才有机会获取该进程的锁查看是否能够唤醒；</p>
+<p>总结来说，sleep的实现需要一个保护sleep的条件的锁；<br>
+并在sleep的内部保证不会出现lost wakeup的情况；</p>
+<h2 id="关闭进程">关闭进程 </h2>
+<p>进程关闭分两种情况，其一是进程A想关闭进程B；其二是进程B自己申请关闭；需要注意的是立刻是否被关闭进程的所有资源是危险的：<br>
+对于第一种情况，可能进程B正在其它核上执行，可能它还持有锁，并且在更新内核数据，直接删掉会导致验证问题；<br>
+对于第二种情况，关闭B进程本身是在B进程中进行的，B进程还在执行代码，如果直接释放资源会导致错误；</p>
+<p>exit函数会首先关闭自己打开的文件（后续章节内容）；<br>
+接着要把自己的子进程的父进程设置为初始进程，因此在此之前我们还需要唤醒initproc；<br>
+在此之后，把当前进程状态设置为ZOMBIE，然后进入调度器；<br>
+注意ZOMBIE并不是UNUESED，但是调度器同样会忽略这个进程，真正的清理资源，重置为UNUSED需要再父进程的wait中进行；</p>
+<p>wait函数就是持续不断地搜寻那些被标记为ZOMBIE的子进程，一旦找到就把这个子进程的资源都给释放掉；<br>
+需要注意的是，wait函数一次只释放一个子进程，因此要调用与子进程数量相当的wait函数来进行回收；</p>
+<p>下面来看需要杀死其它进程的kill系统调用；<br>
+kill调用只是把SLEEPING的进程强行标记为RUNNABLE，并把进程的标志位p-&gt;killed设为1；<br>
+而目标进程在能够安全执行释放的时候，会判断p-&gt;killed是否被设置，从而自行调用exit；<br>
+所以一个进程被kill，并不会立即退出，而是在下一次执行系统调用或者中断触发的时候才会退出；</p>
+<p>从这里我们可以看到，一些p-&gt;killed的判断的合理性，在适当的能退出的时机，应该设置对应的退出窗口；</p>
+<h1 id="lec12">LEC12 </h1>
+<h2 id="文件系统-1">文件系统 </h2>
+<p>文件系统：持久化，计算机重启时仍然存在；</p>
+<p>xv6中文件系统对应的系统调用如下：</p>
+<pre data-role="codeBlock" data-info="c" class="language-c c"><code>fd <span class="token operator">=</span> <span class="token function">open</span><span class="token punctuation">(</span><span class="token string">"x/y"</span> <span class="token punctuation">,</span> <span class="token operator">--</span><span class="token punctuation">)</span><span class="token punctuation">;</span>  <span class="token comment">// 标志位暂不关心</span>
+
+<span class="token function">write</span><span class="token punctuation">(</span>fd <span class="token punctuation">,</span> <span class="token string">"abc"</span> <span class="token punctuation">,</span> <span class="token number">3</span><span class="token punctuation">)</span><span class="token punctuation">;</span>  <span class="token comment">// 隐式保存了offset,使得下一次能从第四个字节开始写</span>
+
+<span class="token function">link</span><span class="token punctuation">(</span><span class="token string">"x/y"</span> <span class="token punctuation">,</span> <span class="token string">"x/z"</span><span class="token punctuation">)</span><span class="token punctuation">;</span> <span class="token comment">// 创建另一个名字</span>
+<span class="token comment">// 需要跟踪同一个文件的多个文件名</span>
+
+<span class="token function">unlink</span><span class="token punctuation">(</span><span class="token string">"x/y"</span><span class="token punctuation">)</span><span class="token punctuation">;</span> <span class="token comment">// 删除文件名</span>
+<span class="token function">write</span><span class="token punctuation">(</span>fd <span class="token punctuation">,</span> <span class="token string">"def"</span> <span class="token punctuation">,</span> <span class="token number">3</span><span class="token punctuation">)</span><span class="token punctuation">;</span> <span class="token comment">// 依然能继续写入数据</span>
+</code></pre><p>文件的对象称为inode，它是由编号（数字）进行区分的，而不依赖于文件路径名；<br>
+inode需要有link count来跟踪指向这个文件名的数量；<br>
+同时需要openfd来跟踪打开这个文件的文件描述符计数；</p>
+<p>另一个重要的数据结构是fd，它的内部需要维护offset；<br>
+文件描述符的主要作用是与用户进程交互；</p>
+<p>文件系统的分层理解（从下至上）如下:<br>
+最底层，磁盘，disk；<br>
+buffer cache，缓存避免频繁读写磁盘，把磁盘数据保存到内存中；<br>
+logging层，保证持久性；<br>
+inode chache,实现同步功能；<br>
+inode，实现read/write功能；<br>
+文件名和文件描述符；</p>
+<h2 id="磁盘使用">磁盘使用 </h2>
+<p>sector:磁盘驱动的最小读取单元，512字节；<br>
+block:文件系统视角的数据，xv6中是1024字节，通常对应多个sector;</p>
+<p>不同的磁盘可能不一样，但在文件系统看来都做了抽象；<br>
+因此文件系统对磁盘的看法可以想成一个巨大的block数组；</p>
+<p>block0 : 要么没用，要么作为boot sector启动操作系统；<br>
+block1 : super block，描述了文件系统的信息；<br>
+block2-block32 : log；<br>
+block32-block45 : 存储inode，一个inode是64字节；<br>
+block46 : bitmap block，记录数据block是否空闲；<br>
+block47-- : 存储文件和目录的内容；</p>
+<h2 id="inode">inode </h2>
+<p>inode是一个64字节的数据结构，包含如下内容：<br>
+type : 表明当前是文件还是目录；<br>
+nlink : 跟踪文件名数量；<br>
+size : 文件数据占用的字节数；<br>
+direct block number ： 指向构成文件的前12个block的位置；<br>
+indirect block number : 指向一个block,这个block中存了256个block编号；</p>
+<p>以上我们可以看出，xv6中文件最多能占用256 + 12 = 268个block,也就是268KB；</p>
+<p>想要扩展文件的大小，可以使用类似多级页表的方式，使用多级indirect block number；<br>
+先指向一个block，这个block指向了256个block，其中的每个block又指向了256个block编号；<br>
+这样就实现了256 * 256KB大小的文件；</p>
+<p>目录：一个文件（存entry列表）加上directory entries；<br>
+每个entry的格式如下：<br>
+前2个字节包含目录中文件或者子目录的inode编号；<br>
+后14个字节包含了文件或者子目录名；</p>
+<p>查找路径名的过程为：<br>
+从起始inode开始，查阅它的所有block，找到下一步文件名时，进入对应的inode编号继续查找；<br>
+当然，这种线性查找名字的效率不高，实际使用中会做优化；</p>
+<h2 id="buffer-cache">buffer cache </h2>
+<p>实际上查询block并不是直接查询磁盘中的block，而是查询内存中缓存的block;<br>
+为了保证多个进程引用缓存是互不影响，需要锁；</p>
+<p>首先有一个对于buffer cache的锁，bcache.lock;<br>
+检查cache中某个block是否存在，并对cache中的某个block的引用数加1时必须处在bcache.lock中；<br>
+这里的引用数指的是有多少进程需要持有这个缓存块（避免buf占满时清除掉）；<br>
+因此另一个进程没有办法同时修改buffer cache;</p>
+<p>之后，需要获取cache中找的块（假设为b）的锁b-&gt;block；<br>
+在对b进行读写操作时，必须处于b-&gt;lock的锁中；<br>
+注意这里的锁是sleep锁，因为锁被持有的时间可能很长，因此另一个在等待锁被释放的进程会进入睡眠状态，不占用CPU；</p>
+<p>需要注意buffer cache中每个块的缓存只能有一个，否则会造成覆盖；</p>
+<h2 id="sleep-lock">sleep lock </h2>
+<p>sleeplock的获取使用的是aquiresleep函数：<br>
+<img src="..\assets\images\6.s081\image-17.png" alt="alt text"><br>
+可以看到，当sleep锁未上锁时，只是打了一个标记；<br>
+注意sleep锁本身靠一个spinlock保护，确保同一时间只能有一个进程在修改sleep锁的状态；<br>
+而当sleep锁被标记时，会进入sleep状态；<br>
+会想之前，sleep函数的实现需要维护一个睡眠条件的锁，也就是这里的lk-&gt;lk；</p>
+<p>注意，在声明对一个缓存块不感兴趣时brelse中，如果缓存块的引用数为0，我们需要将其放到bcache中的头部，这时当需要清理block cache时能够迅速地清楚最近被使用的块，这是最节省资源的；</p>
+<h2 id="lab8--locks">Lab8 : locks </h2>
+<p>点击展开以下实验的具体代码实现：</p>
+<details>
+<summary>Memory allocator</summary>
+<p>在kernel/kalloc.c中进行修改：</p>
+<pre data-role="codeBlock" data-info="c" class="language-c c"><code><span class="token keyword keyword-struct">struct</span> <span class="token punctuation">{</span>
+  <span class="token keyword keyword-struct">struct</span> <span class="token class-name">spinlock</span> lock<span class="token punctuation">;</span>
+  <span class="token keyword keyword-struct">struct</span> <span class="token class-name">run</span> <span class="token operator">*</span>freelist<span class="token punctuation">;</span>
+<span class="token punctuation">}</span> kmem<span class="token punctuation">[</span>NCPU<span class="token punctuation">]</span><span class="token punctuation">;</span> <span class="token comment">// 为每个cpu配备一个kmem</span>
+
+<span class="token keyword keyword-void">void</span>
+<span class="token function">kinit</span><span class="token punctuation">(</span><span class="token punctuation">)</span>
+<span class="token punctuation">{</span>
+  <span class="token comment">// 每个cpu上的kmem锁都要初始化</span>
+  <span class="token keyword keyword-for">for</span><span class="token punctuation">(</span><span class="token keyword keyword-int">int</span> i<span class="token operator">=</span><span class="token number">0</span> <span class="token punctuation">;</span> i <span class="token operator">&lt;</span> NCPU  <span class="token punctuation">;</span> i<span class="token operator">++</span><span class="token punctuation">)</span>
+    <span class="token function">initlock</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>kmem<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>lock<span class="token punctuation">,</span> <span class="token string">"kmem"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+  <span class="token function">freerange</span><span class="token punctuation">(</span>end<span class="token punctuation">,</span> <span class="token punctuation">(</span><span class="token keyword keyword-void">void</span><span class="token operator">*</span><span class="token punctuation">)</span>PHYSTOP<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+
+<span class="token keyword keyword-void">void</span>
+<span class="token function">kfree</span><span class="token punctuation">(</span><span class="token keyword keyword-void">void</span> <span class="token operator">*</span>pa<span class="token punctuation">)</span>
+<span class="token punctuation">{</span>
+  <span class="token keyword keyword-struct">struct</span> <span class="token class-name">run</span> <span class="token operator">*</span>r<span class="token punctuation">;</span>
+
+  <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span><span class="token punctuation">(</span><span class="token punctuation">(</span>uint64<span class="token punctuation">)</span>pa <span class="token operator">%</span> PGSIZE<span class="token punctuation">)</span> <span class="token operator">!=</span> <span class="token number">0</span> <span class="token operator">||</span> <span class="token punctuation">(</span><span class="token keyword keyword-char">char</span><span class="token operator">*</span><span class="token punctuation">)</span>pa <span class="token operator">&lt;</span> end <span class="token operator">||</span> <span class="token punctuation">(</span>uint64<span class="token punctuation">)</span>pa <span class="token operator">&gt;=</span> PHYSTOP<span class="token punctuation">)</span>
+    <span class="token function">panic</span><span class="token punctuation">(</span><span class="token string">"kfree"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+  <span class="token comment">// Fill with junk to catch dangling refs.</span>
+  <span class="token function">memset</span><span class="token punctuation">(</span>pa<span class="token punctuation">,</span> <span class="token number">1</span><span class="token punctuation">,</span> PGSIZE<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+  r <span class="token operator">=</span> <span class="token punctuation">(</span><span class="token keyword keyword-struct">struct</span> <span class="token class-name">run</span><span class="token operator">*</span><span class="token punctuation">)</span>pa<span class="token punctuation">;</span>
+
+  <span class="token function">push_off</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span> <span class="token comment">// 关闭中断</span>
+  <span class="token keyword keyword-int">int</span> id <span class="token operator">=</span> <span class="token function">cpuid</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+  <span class="token function">acquire</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>kmem<span class="token punctuation">[</span>id<span class="token punctuation">]</span><span class="token punctuation">.</span>lock<span class="token punctuation">)</span><span class="token punctuation">;</span>
+  r<span class="token operator">-&gt;</span>next <span class="token operator">=</span> kmem<span class="token punctuation">[</span>id<span class="token punctuation">]</span><span class="token punctuation">.</span>freelist<span class="token punctuation">;</span>
+  kmem<span class="token punctuation">[</span>id<span class="token punctuation">]</span><span class="token punctuation">.</span>freelist <span class="token operator">=</span> r<span class="token punctuation">;</span>
+  <span class="token function">release</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>kmem<span class="token punctuation">[</span>id<span class="token punctuation">]</span><span class="token punctuation">.</span>lock<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+  <span class="token function">pop_off</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span> <span class="token comment">// 打开中断</span>
+<span class="token punctuation">}</span>
+
+<span class="token keyword keyword-void">void</span> <span class="token operator">*</span>
+<span class="token function">kalloc</span><span class="token punctuation">(</span><span class="token keyword keyword-void">void</span><span class="token punctuation">)</span>
+<span class="token punctuation">{</span>
+  <span class="token keyword keyword-struct">struct</span> <span class="token class-name">run</span> <span class="token operator">*</span>r<span class="token punctuation">;</span>
+
+  <span class="token function">push_off</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span> <span class="token comment">// 关闭中断</span>
+  <span class="token keyword keyword-int">int</span> id <span class="token operator">=</span> <span class="token function">cpuid</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+  <span class="token function">acquire</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>kmem<span class="token punctuation">[</span>id<span class="token punctuation">]</span><span class="token punctuation">.</span>lock<span class="token punctuation">)</span><span class="token punctuation">;</span>
+  r <span class="token operator">=</span> kmem<span class="token punctuation">[</span>id<span class="token punctuation">]</span><span class="token punctuation">.</span>freelist<span class="token punctuation">;</span>
+  <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span>r<span class="token punctuation">)</span>
+    kmem<span class="token punctuation">[</span>id<span class="token punctuation">]</span><span class="token punctuation">.</span>freelist <span class="token operator">=</span> r<span class="token operator">-&gt;</span>next<span class="token punctuation">;</span>
+  <span class="token keyword keyword-else">else</span><span class="token punctuation">{</span>
+    <span class="token comment">// 当前cpu的空闲列表为空，需要从其他地方偷内存</span>
+    <span class="token keyword keyword-for">for</span><span class="token punctuation">(</span><span class="token keyword keyword-int">int</span> i <span class="token operator">=</span> <span class="token number">0</span> <span class="token punctuation">;</span> i <span class="token operator">&lt;</span> NCPU <span class="token punctuation">;</span> i<span class="token operator">++</span><span class="token punctuation">)</span><span class="token punctuation">{</span>
+      <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span>i <span class="token operator">==</span> id<span class="token punctuation">)</span>
+        <span class="token keyword keyword-continue">continue</span><span class="token punctuation">;</span>
+
+      <span class="token function">acquire</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>kmem<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>lock<span class="token punctuation">)</span><span class="token punctuation">;</span>
+      r <span class="token operator">=</span> kmem<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>freelist<span class="token punctuation">;</span>
+      <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span>r<span class="token punctuation">)</span><span class="token punctuation">{</span>
+        <span class="token comment">// 找到非空的空闲列表，偷来用</span>
+        kmem<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>freelist <span class="token operator">=</span> r<span class="token operator">-&gt;</span>next<span class="token punctuation">;</span>
+        <span class="token function">release</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>kmem<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>lock<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token comment">// 一旦取到空闲页就退出</span>
+        <span class="token keyword keyword-break">break</span><span class="token punctuation">;</span>
+      <span class="token punctuation">}</span>
+
+      <span class="token function">release</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>kmem<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>lock<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+  <span class="token punctuation">}</span>
+  <span class="token function">release</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>kmem<span class="token punctuation">[</span>id<span class="token punctuation">]</span><span class="token punctuation">.</span>lock<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+  <span class="token function">pop_off</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span> <span class="token comment">// 打开中断</span>
+
+  <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span>r<span class="token punctuation">)</span>
+    <span class="token function">memset</span><span class="token punctuation">(</span><span class="token punctuation">(</span><span class="token keyword keyword-char">char</span><span class="token operator">*</span><span class="token punctuation">)</span>r<span class="token punctuation">,</span> <span class="token number">5</span><span class="token punctuation">,</span> PGSIZE<span class="token punctuation">)</span><span class="token punctuation">;</span> <span class="token comment">// fill with junk</span>
+  <span class="token keyword keyword-return">return</span> <span class="token punctuation">(</span><span class="token keyword keyword-void">void</span><span class="token operator">*</span><span class="token punctuation">)</span>r<span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+</code></pre></details>
+<details>
+<summary>buffer cache</summary>
+<p>修改kernel/buf.h：</p>
+<pre data-role="codeBlock" data-info="c" class="language-c c"><code><span class="token keyword keyword-struct">struct</span> <span class="token class-name">buf</span> <span class="token punctuation">{</span>
+  <span class="token keyword keyword-int">int</span> valid<span class="token punctuation">;</span>   <span class="token comment">// has data been read from disk?</span>
+  <span class="token keyword keyword-int">int</span> disk<span class="token punctuation">;</span>    <span class="token comment">// does disk "own" buf?</span>
+  uint dev<span class="token punctuation">;</span>
+  uint blockno<span class="token punctuation">;</span>
+  <span class="token keyword keyword-struct">struct</span> <span class="token class-name">sleeplock</span> lock<span class="token punctuation">;</span>
+  uint refcnt<span class="token punctuation">;</span>
+  <span class="token comment">// struct buf *prev; // LRU cache list</span>
+  <span class="token comment">// 原先实现LRU的方式是全局链表</span>
+  <span class="token comment">// 把最近使用的挂在头部</span>
+  <span class="token comment">// 但这样需要把整个缓冲区锁起来操作</span>
+  <span class="token comment">// 现在使用时间戳标记每个块</span>
+  <span class="token comment">// 因此操作时只需修改对应块的时间戳，无需把整个缓冲区锁起来操作</span>
+  
+  uint time<span class="token punctuation">;</span> <span class="token comment">// 每个块的时间戳</span>
+  <span class="token keyword keyword-struct">struct</span> <span class="token class-name">buf</span> <span class="token operator">*</span>next<span class="token punctuation">;</span>
+  uchar data<span class="token punctuation">[</span>BSIZE<span class="token punctuation">]</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span><span class="token punctuation">;</span>
+</code></pre><p>修改kernel/bio.c：</p>
+<pre data-role="codeBlock" data-info="c" class="language-c c"><code><span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">define</span> <span class="token macro-name">NBUCKET</span> <span class="token expression"><span class="token number">13</span></span></span>
+<span class="token comment">// 不能为每个cpu分别维护</span>
+<span class="token comment">// 在上一个实验中，原则上页表是进程私有的</span>
+<span class="token comment">// 而这里的缓冲区，所有进程都可以访问</span>
+
+<span class="token keyword keyword-extern">extern</span> uint ticks<span class="token punctuation">;</span>
+
+<span class="token keyword keyword-struct">struct</span> <span class="token punctuation">{</span>
+  <span class="token comment">// 将缓存区分成13组，每组单独维护锁和表头</span>
+  <span class="token keyword keyword-struct">struct</span> <span class="token class-name">spinlock</span> lock<span class="token punctuation">[</span>NBUCKET<span class="token punctuation">]</span><span class="token punctuation">;</span>
+  <span class="token keyword keyword-struct">struct</span> <span class="token class-name">buf</span> buf<span class="token punctuation">[</span>NBUF<span class="token punctuation">]</span><span class="token punctuation">;</span>
+
+  <span class="token comment">// Linked list of all buffers, through prev/next.</span>
+  <span class="token comment">// Sorted by how recently the buffer was used.</span>
+  <span class="token comment">// head.next is most recent, head.prev is least.</span>
+  <span class="token keyword keyword-struct">struct</span> <span class="token class-name">buf</span> head<span class="token punctuation">[</span>NBUCKET<span class="token punctuation">]</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span> bcache<span class="token punctuation">;</span>
+
+<span class="token keyword keyword-void">void</span>
+<span class="token function">binit</span><span class="token punctuation">(</span><span class="token keyword keyword-void">void</span><span class="token punctuation">)</span>
+<span class="token punctuation">{</span>
+  <span class="token keyword keyword-struct">struct</span> <span class="token class-name">buf</span> <span class="token operator">*</span>b<span class="token punctuation">;</span>
+
+  <span class="token keyword keyword-for">for</span><span class="token punctuation">(</span><span class="token keyword keyword-int">int</span> i <span class="token operator">=</span> <span class="token number">0</span> <span class="token punctuation">;</span> i <span class="token operator">&lt;</span> NBUCKET <span class="token punctuation">;</span> i<span class="token operator">++</span><span class="token punctuation">)</span>
+    <span class="token function">initlock</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>bcache<span class="token punctuation">.</span>lock<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">,</span> <span class="token string">"bcache"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+  <span class="token comment">// 初始化时把所有buf放在编号为0的桶中</span>
+  bcache<span class="token punctuation">.</span>head<span class="token punctuation">[</span><span class="token number">0</span><span class="token punctuation">]</span><span class="token punctuation">.</span>next <span class="token operator">=</span> <span class="token operator">&amp;</span>bcache<span class="token punctuation">.</span>buf<span class="token punctuation">[</span><span class="token number">0</span><span class="token punctuation">]</span><span class="token punctuation">;</span>
+  <span class="token keyword keyword-for">for</span><span class="token punctuation">(</span>b <span class="token operator">=</span> bcache<span class="token punctuation">.</span>buf<span class="token punctuation">;</span> b <span class="token operator">&lt;</span> bcache<span class="token punctuation">.</span>buf<span class="token operator">+</span>NBUF<span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">;</span> b<span class="token operator">++</span><span class="token punctuation">)</span><span class="token punctuation">{</span>
+    b<span class="token operator">-&gt;</span>next <span class="token operator">=</span> b <span class="token operator">+</span> <span class="token number">1</span><span class="token punctuation">;</span>
+    <span class="token function">initsleeplock</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>b<span class="token operator">-&gt;</span>lock<span class="token punctuation">,</span> <span class="token string">"buffer"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+  <span class="token punctuation">}</span>
+  <span class="token function">initsleeplock</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>b<span class="token operator">-&gt;</span>lock<span class="token punctuation">,</span> <span class="token string">"buffer"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+
+<span class="token keyword keyword-static">static</span> <span class="token keyword keyword-struct">struct</span> <span class="token class-name">buf</span><span class="token operator">*</span>
+<span class="token function">bget</span><span class="token punctuation">(</span>uint dev<span class="token punctuation">,</span> uint blockno<span class="token punctuation">)</span>
+<span class="token punctuation">{</span>
+  <span class="token keyword keyword-struct">struct</span> <span class="token class-name">buf</span> <span class="token operator">*</span>b <span class="token punctuation">,</span> <span class="token operator">*</span>id_last<span class="token punctuation">;</span>
+  <span class="token keyword keyword-struct">struct</span> <span class="token class-name">buf</span> <span class="token operator">*</span>target_b <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span>
+  <span class="token comment">// id_last用于找到id桶的最后一个元素</span>
+
+  <span class="token comment">// 先在对应的桶中寻找，处理能找得到对应缓存块的情况</span>
+  <span class="token comment">// 此时只需要把要找的桶锁起来即可</span>
+  <span class="token comment">// 如果直接有可用的buf,则直接使用即可</span>
+
+  <span class="token keyword keyword-int">int</span> id <span class="token operator">=</span> blockno <span class="token operator">%</span> NBUCKET<span class="token punctuation">;</span>
+
+  <span class="token function">acquire</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>bcache<span class="token punctuation">.</span>lock<span class="token punctuation">[</span>id<span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+  <span class="token keyword keyword-for">for</span><span class="token punctuation">(</span>b <span class="token operator">=</span> bcache<span class="token punctuation">.</span>head<span class="token punctuation">[</span>id<span class="token punctuation">]</span><span class="token punctuation">.</span>next <span class="token punctuation">,</span> id_last <span class="token operator">=</span> <span class="token operator">&amp;</span>bcache<span class="token punctuation">.</span>head<span class="token punctuation">[</span>id<span class="token punctuation">]</span><span class="token punctuation">;</span> b <span class="token punctuation">;</span> b <span class="token operator">=</span> b<span class="token operator">-&gt;</span>next <span class="token punctuation">,</span> id_last <span class="token operator">=</span> id_last<span class="token operator">-&gt;</span>next<span class="token punctuation">)</span><span class="token punctuation">{</span>
+    <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span>b<span class="token operator">-&gt;</span>dev <span class="token operator">==</span> dev <span class="token operator">&amp;&amp;</span> b<span class="token operator">-&gt;</span>blockno <span class="token operator">==</span> blockno<span class="token punctuation">)</span><span class="token punctuation">{</span>
+      b<span class="token operator">-&gt;</span>time <span class="token operator">=</span> ticks<span class="token punctuation">;</span>
+      b<span class="token operator">-&gt;</span>refcnt<span class="token operator">++</span><span class="token punctuation">;</span>
+      <span class="token function">release</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>bcache<span class="token punctuation">.</span>lock<span class="token punctuation">[</span>id<span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+      <span class="token function">acquiresleep</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>b<span class="token operator">-&gt;</span>lock<span class="token punctuation">)</span><span class="token punctuation">;</span>
+      <span class="token keyword keyword-return">return</span> b<span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+    <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span>b<span class="token operator">-&gt;</span>refcnt <span class="token operator">==</span> <span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">{</span>
+      target_b <span class="token operator">=</span> b<span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+  <span class="token punctuation">}</span>
+
+  <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span>target_b<span class="token punctuation">)</span><span class="token punctuation">{</span>
+    <span class="token comment">// 找到可以使用的空闲块</span>
+    target_b<span class="token operator">-&gt;</span>dev <span class="token operator">=</span> dev<span class="token punctuation">;</span>
+    target_b<span class="token operator">-&gt;</span>blockno <span class="token operator">=</span> blockno<span class="token punctuation">;</span>
+    target_b<span class="token operator">-&gt;</span>valid <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span>
+    target_b<span class="token operator">-&gt;</span>refcnt <span class="token operator">=</span> <span class="token number">1</span><span class="token punctuation">;</span>
+    target_b<span class="token operator">-&gt;</span>time <span class="token operator">=</span> ticks<span class="token punctuation">;</span>
+    <span class="token function">release</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>bcache<span class="token punctuation">.</span>lock<span class="token punctuation">[</span>id<span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token function">acquiresleep</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>target_b<span class="token operator">-&gt;</span>lock<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token keyword keyword-return">return</span> target_b<span class="token punctuation">;</span>
+  <span class="token punctuation">}</span>
+
+  <span class="token comment">// 如果在对应的桶中没有找到缓存块，也没有空闲块，到其他桶中寻找 </span>
+  <span class="token comment">// 此时目标桶还被锁着</span>
+
+  uint min_time <span class="token operator">=</span> __UINT32_MAX__<span class="token punctuation">;</span>
+  <span class="token keyword keyword-int">int</span> index <span class="token operator">=</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">;</span>
+
+  <span class="token keyword keyword-struct">struct</span> <span class="token class-name">buf</span> <span class="token operator">*</span>last<span class="token punctuation">;</span>
+  <span class="token keyword keyword-struct">struct</span> <span class="token class-name">buf</span> <span class="token operator">*</span>fa_b <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span>
+  
+  <span class="token comment">// 先找到lru块对应的桶的编号</span>
+  <span class="token keyword keyword-for">for</span><span class="token punctuation">(</span><span class="token keyword keyword-int">int</span> i <span class="token operator">=</span> <span class="token number">0</span> <span class="token punctuation">;</span> i <span class="token operator">&lt;</span> NBUCKET <span class="token punctuation">;</span> i<span class="token operator">++</span><span class="token punctuation">)</span><span class="token punctuation">{</span>
+    <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span>i <span class="token operator">==</span> id<span class="token punctuation">)</span>
+      <span class="token keyword keyword-continue">continue</span><span class="token punctuation">;</span>
+
+    <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span>id <span class="token operator">&lt;</span> i<span class="token punctuation">)</span>
+      <span class="token function">acquire</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>bcache<span class="token punctuation">.</span>lock<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token keyword keyword-else">else</span><span class="token punctuation">{</span>
+      <span class="token comment">// 同时拥有2把锁时，交换锁的顺序，避免死锁</span>
+      <span class="token comment">// 不加这个逻辑的话，会导致make grade的usertests通不过</span>
+      <span class="token function">release</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>bcache<span class="token punctuation">.</span>lock<span class="token punctuation">[</span>id<span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+      <span class="token function">acquire</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>bcache<span class="token punctuation">.</span>lock<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+      <span class="token function">acquire</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>bcache<span class="token punctuation">.</span>lock<span class="token punctuation">[</span>id<span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+
+    <span class="token keyword keyword-for">for</span><span class="token punctuation">(</span>b <span class="token operator">=</span> bcache<span class="token punctuation">.</span>head<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>next <span class="token punctuation">,</span> last <span class="token operator">=</span> <span class="token operator">&amp;</span>bcache<span class="token punctuation">.</span>head<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">;</span> b <span class="token punctuation">;</span> b <span class="token operator">=</span> b<span class="token operator">-&gt;</span>next <span class="token punctuation">,</span> last <span class="token operator">=</span> last<span class="token operator">-&gt;</span>next<span class="token punctuation">)</span><span class="token punctuation">{</span>
+      <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span>b<span class="token operator">-&gt;</span>time <span class="token operator">&lt;</span> min_time <span class="token operator">&amp;&amp;</span> b<span class="token operator">-&gt;</span>refcnt <span class="token operator">==</span> <span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">{</span>
+        min_time <span class="token operator">=</span> b<span class="token operator">-&gt;</span>time<span class="token punctuation">;</span>
+        target_b <span class="token operator">=</span> b<span class="token punctuation">;</span>
+        fa_b <span class="token operator">=</span> last<span class="token punctuation">;</span>
+
+        <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span>index <span class="token operator">!=</span> <span class="token operator">-</span><span class="token number">1</span> <span class="token operator">&amp;&amp;</span> index <span class="token operator">!=</span> i <span class="token operator">&amp;&amp;</span> <span class="token function">holding</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>bcache<span class="token punctuation">.</span>lock<span class="token punctuation">[</span>index<span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">{</span>
+          <span class="token comment">// 要找的lru的桶的锁会在之后释放</span>
+          <span class="token comment">// 此处释放那些不是lru的桶的锁</span>
+          <span class="token function">release</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>bcache<span class="token punctuation">.</span>lock<span class="token punctuation">[</span>index<span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+        index <span class="token operator">=</span> i<span class="token punctuation">;</span>
+      <span class="token punctuation">}</span>
+    <span class="token punctuation">}</span>
+    <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span>index <span class="token operator">!=</span> i<span class="token punctuation">)</span><span class="token punctuation">{</span>
+      <span class="token comment">// 当前的i桶不是lru，则释放锁</span>
+      <span class="token function">release</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>bcache<span class="token punctuation">.</span>lock<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+      <span class="token comment">// 这里其实有一点问题，可能把之前的桶释放掉之后</span>
+      <span class="token comment">// 其他进程去掉了对某个缓存块的引用，使其成为lru</span>
+      <span class="token comment">// 也就是说这里可能无法捕捉全局lru</span>
+      <span class="token comment">// 不过问题不大，只要是能删掉的就行，不一定非要全局lru</span>
+    <span class="token punctuation">}</span>
+  <span class="token punctuation">}</span>
+
+  <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span>index <span class="token operator">==</span> <span class="token operator">-</span><span class="token number">1</span> <span class="token operator">||</span> <span class="token punctuation">(</span><span class="token operator">!</span>target_b<span class="token punctuation">)</span><span class="token punctuation">)</span>
+    <span class="token function">panic</span><span class="token punctuation">(</span><span class="token string">"bget: no buffers"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+  <span class="token comment">// 注意这时候有2把锁</span>
+  <span class="token comment">// 一把是id的锁，一把是index的锁</span>
+
+  fa_b<span class="token operator">-&gt;</span>next <span class="token operator">=</span> target_b<span class="token operator">-&gt;</span>next<span class="token punctuation">;</span>
+  <span class="token comment">// 从index桶中拿出</span>
+  <span class="token function">release</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>bcache<span class="token punctuation">.</span>lock<span class="token punctuation">[</span>index<span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+  <span class="token comment">// 对index桶的操作已结束，可以释放锁</span>
+
+  target_b<span class="token operator">-&gt;</span>next <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span>
+  id_last<span class="token operator">-&gt;</span>next <span class="token operator">=</span> target_b<span class="token punctuation">;</span>
+  <span class="token comment">// 放入id桶中的最后一个</span>
+
+  target_b<span class="token operator">-&gt;</span>dev <span class="token operator">=</span> dev<span class="token punctuation">;</span>
+  target_b<span class="token operator">-&gt;</span>blockno <span class="token operator">=</span> blockno<span class="token punctuation">;</span>
+  target_b<span class="token operator">-&gt;</span>valid <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span>
+  target_b<span class="token operator">-&gt;</span>refcnt <span class="token operator">=</span> <span class="token number">1</span><span class="token punctuation">;</span>
+  target_b<span class="token operator">-&gt;</span>time <span class="token operator">=</span> ticks<span class="token punctuation">;</span>
+  <span class="token function">release</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>bcache<span class="token punctuation">.</span>lock<span class="token punctuation">[</span>id<span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+  <span class="token function">acquiresleep</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>target_b<span class="token operator">-&gt;</span>lock<span class="token punctuation">)</span><span class="token punctuation">;</span>
+  <span class="token keyword keyword-return">return</span> target_b<span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+
+<span class="token comment">// 以下几个函数需要取桶的id，并针对性加锁</span>
+<span class="token keyword keyword-void">void</span>
+<span class="token function">brelse</span><span class="token punctuation">(</span><span class="token keyword keyword-struct">struct</span> <span class="token class-name">buf</span> <span class="token operator">*</span>b<span class="token punctuation">)</span>
+<span class="token punctuation">{</span>
+  <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span><span class="token operator">!</span><span class="token function">holdingsleep</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>b<span class="token operator">-&gt;</span>lock<span class="token punctuation">)</span><span class="token punctuation">)</span>
+    <span class="token function">panic</span><span class="token punctuation">(</span><span class="token string">"brelse"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+  <span class="token function">releasesleep</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>b<span class="token operator">-&gt;</span>lock<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+  <span class="token keyword keyword-int">int</span> id <span class="token operator">=</span> <span class="token punctuation">(</span>b<span class="token operator">-&gt;</span>blockno<span class="token punctuation">)</span> <span class="token operator">%</span> NBUCKET<span class="token punctuation">;</span>
+  <span class="token function">acquire</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>bcache<span class="token punctuation">.</span>lock<span class="token punctuation">[</span>id<span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+  b<span class="token operator">-&gt;</span>refcnt<span class="token operator">--</span><span class="token punctuation">;</span>
+  <span class="token function">release</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>bcache<span class="token punctuation">.</span>lock<span class="token punctuation">[</span>id<span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+
+<span class="token keyword keyword-void">void</span>
+<span class="token function">bpin</span><span class="token punctuation">(</span><span class="token keyword keyword-struct">struct</span> <span class="token class-name">buf</span> <span class="token operator">*</span>b<span class="token punctuation">)</span> <span class="token punctuation">{</span>
+  <span class="token keyword keyword-int">int</span> id <span class="token operator">=</span> <span class="token punctuation">(</span>b<span class="token operator">-&gt;</span>blockno<span class="token punctuation">)</span> <span class="token operator">%</span> NBUCKET<span class="token punctuation">;</span>
+  <span class="token function">acquire</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>bcache<span class="token punctuation">.</span>lock<span class="token punctuation">[</span>id<span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+  b<span class="token operator">-&gt;</span>refcnt<span class="token operator">++</span><span class="token punctuation">;</span>
+  <span class="token function">release</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>bcache<span class="token punctuation">.</span>lock<span class="token punctuation">[</span>id<span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+
+<span class="token keyword keyword-void">void</span>
+<span class="token function">bunpin</span><span class="token punctuation">(</span><span class="token keyword keyword-struct">struct</span> <span class="token class-name">buf</span> <span class="token operator">*</span>b<span class="token punctuation">)</span> <span class="token punctuation">{</span>
+  <span class="token keyword keyword-int">int</span> id <span class="token operator">=</span> <span class="token punctuation">(</span>b<span class="token operator">-&gt;</span>blockno<span class="token punctuation">)</span> <span class="token operator">%</span> NBUCKET<span class="token punctuation">;</span>
+  <span class="token function">acquire</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>bcache<span class="token punctuation">.</span>lock<span class="token punctuation">[</span>id<span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+  b<span class="token operator">-&gt;</span>refcnt<span class="token operator">--</span><span class="token punctuation">;</span>
+  <span class="token function">release</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>bcache<span class="token punctuation">.</span>lock<span class="token punctuation">[</span>id<span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+</code></pre></details>
+<h1 id="lec13">LEC13 </h1>
+<h2 id="文件系统crash">文件系统crash </h2>
+<p>创建一个文件x（在根目录下）需要多步操作：<br>
+（1）分配inode（标记type）；<br>
+（2）初始化inode（填写linkcount等）；<br>
+（3）更新根目录的数据块；<br>
+（4）更新根目录的inode（size变化）；<br>
+（5）再次更新文件x的inode；</p>
+<p>假设在（2）和（3）之间发生断电，这将导致inode被分配但是在根目录中却找不到它，也就是任何目录中都无法找到该inode；</p>
+<p>再考虑写入文件的过程：<br>
+（1）从bitmap block分配一个data block；<br>
+（2）写入字符到这个data block中；<br>
+（3）更新文件x的size；</p>
+<p>如果在（1）和（2）之间断电，那么数据块被分配之后丢失了，因为它不属于任何文件；</p>
+<p>注意交换操作顺序并不能解决问题，真正的原因在于我们需要让这些写磁盘的操作是原子操作，否则在操作过程中崩溃均会导致错误；</p>
+<h2 id="logging系统">logging系统 </h2>
+<p>解决以上问题的想法并不复杂：<br>
+在需要写入block时，我们并不直接写入，而是将写操作写入到log中；<br>
+等到写操作结束了，再commit文件系统的操作（log会自动记录操作个数）；<br>
+真正执行操作时，把log区域内存储的内容一次性写入block中，称为install；<br>
+最后清除log（设置操作数为0）；</p>
+<p>这样不会造成任何问题：<br>
+假如完成commit之前（写入log或commit时）断电，重启后发现这一部分commit是无效的，会忽略掉这些log，并不会真正写入有用的block；<br>
+假如commit之后断电，重启时会再次进行install，注意反复写入block并不会造成错误；</p>
+<p>从以上我们可知，文件系统必须知道写入block的开始和结束，用begin_op和end_op表示；<br>
+从代码上来看，对于文件系统而言，可以认为begin_op()和end_op()之间的过程是原子性的；</p>
+<p>需要注意的是我们仍然是在内存的缓存上实现的，也就是说即使是写入log也不是直接写入到磁盘上，而是会写到内存缓存中；<br>
+只不过将之前直接写入磁盘的函数bwrite替换为log_write；<br>
+log_write的作用是将要写入的block的编号存到log.lh中；<br>
+log.lh中存的信息是要写入几个block以及这些block分别是什么；<br>
+注意这里有一个小技巧，就是如果已经存入则无需在log.lh中新增待写的block任务；</p>
+<p>end_op()函数的功能是完成内存中log向磁盘中的转移，并将要写的任务写入磁盘block中；</p>
+<p>它首先会调用commit函数；<br>
+<img src="..\assets\images\6.s081\image-18.png" alt="alt text"><br>
+commit函数会先进行write_log;<br>
+write_log的作用是把log.lh中记录的那些block从缓存区写入磁盘log中（注意不是block）；</p>
+<p>接着调用write_head把log.lh写入磁盘中，这里相当于给磁盘提交了操作数，即之前所说的commit标志；</p>
+<p>再这之后会进行install_trans，也就是把磁盘中log的那些块按照log.lh的指示写入磁盘中；</p>
+<p>完成所有操作之后，清除log，实际上就是把log.lh.n置零。</p>
+<p>当系统重启后，或者说xv6启动时，会调用initlog函数；<br>
+它几乎相当于再次执行install_trans，也就是把log再次写入block中；</p>
+<p>不得不指出的时，为了进行保护，我们的效率降低了一倍；<br>
+因为我们把要写入磁盘的内容写了2次，后续会寻求优化；</p>
+<h2 id="疑难解决">疑难解决 </h2>
+<p>考虑在写的过程中，磁盘缓存满了，这时候撤回磁盘缓存意味着要先把缓存写入到磁盘中；<br>
+但是我们规定了必须先写入log才能写入缓存，因此这么做会出问题；</p>
+<p>解决问题的方法是，在log_write函数中调用了bpin函数；<br>
+bpin的目的是避免当前而对block从缓存中被清除，实现的方式就是增加缓存计数；<br>
+我们知道当缓存引用不为0时，是不会被撤回的；<br>
+需要注意的是，在数据写入到log之后，要unpin一下，减去此时增加的缓存计数；<br>
+当然，因为每个log中的block可能都需要在缓存中锁定，因此cache的尺寸需要大于log的尺寸；</p>
+<p>第二个问题是log的尺寸；<br>
+如果写入一个超大的文件，log中放不下，怎么解决；<br>
+首先我们得考虑，log放不下的情况仅仅只会是写入文件内容的操作，在创建文件等容易引发崩溃的时刻，涉及到的需要写的block是很小的；<br>
+对于写入文件内容的操作，实际上我们并不要求它是原子化的；<br>
+因此我们可以分批写入，即每一次begin_op和end_op之间只写入一小节内容；</p>
+<p>最后，考虑多个文件系统并发写入log；<br>
+如果它们的log都没有完成commit就已经把log空间占满了，会导致无法真正写入磁盘中；<br>
+因此我们需要限制并发的文件系统操作个数；</p>
+<p>限制并发在begin_op中实现；<br>
+begin_op先进行检测，如果当前log处于commit过程，就会等到log提交完成；<br>
+如果当前操作是允许并发的操作个数的最后一个，会进入sleep等待所有之前的操作结束；</p>
+<p>同样地，在end_op过程中，我们并不会在每个并发进程进行到此处时都进行一次log到block的磁盘转移；<br>
+而是在所有并发进程都完成commit之后，才打包进行一次log到commit的转移；</p>
+<h2 id="lab9--file-system">Lab9 : file system </h2>
+<p>点击可以展开以下实验的具体代码实现：</p>
+<details>
+<summary>Large files</summary>
+<p>修改kernel/file.h中结构体：</p>
+<pre data-role="codeBlock" data-info="c" class="language-c c"><code><span class="token keyword keyword-struct">struct</span> <span class="token class-name">inode</span> <span class="token punctuation">{</span>
+  <span class="token comment">// 其他部分不变</span>
+  uint addrs<span class="token punctuation">[</span>NDIRECT<span class="token operator">+</span><span class="token number">1</span><span class="token operator">+</span><span class="token number">1</span><span class="token punctuation">]</span><span class="token punctuation">;</span>
+  <span class="token comment">// 再加1</span>
+<span class="token punctuation">}</span>
+</code></pre><p>修改kernel/fs.h：</p>
+<pre data-role="codeBlock" data-info="c" class="language-c c"><code><span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">define</span> <span class="token macro-name">NDIRECT</span> <span class="token expression"><span class="token number">11</span></span></span>
+<span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">define</span> <span class="token macro-name">NINDIRECT</span> <span class="token expression"><span class="token punctuation">(</span>BSIZE <span class="token operator">/</span> <span class="token keyword keyword-sizeof">sizeof</span><span class="token punctuation">(</span>uint<span class="token punctuation">)</span><span class="token punctuation">)</span></span></span>
+<span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">define</span> <span class="token macro-name">NDBINDIRECT</span> <span class="token expression"><span class="token punctuation">(</span>BSIZE <span class="token operator">/</span> <span class="token keyword keyword-sizeof">sizeof</span><span class="token punctuation">(</span>uint<span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token operator">*</span> <span class="token punctuation">(</span>BSIZE <span class="token operator">/</span> <span class="token keyword keyword-sizeof">sizeof</span><span class="token punctuation">(</span>uint<span class="token punctuation">)</span><span class="token punctuation">)</span></span></span>
+<span class="token comment">// 二级结构的大小是256 * 256</span>
+
+<span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">define</span> <span class="token macro-name">MAXFILE</span> <span class="token expression"><span class="token punctuation">(</span>NDIRECT <span class="token operator">+</span> NINDIRECT <span class="token operator">+</span> NDBINDIRECT<span class="token punctuation">)</span></span></span>
+
+<span class="token comment">// On-disk inode structure</span>
+<span class="token keyword keyword-struct">struct</span> <span class="token class-name">dinode</span> <span class="token punctuation">{</span>
+  <span class="token keyword keyword-short">short</span> type<span class="token punctuation">;</span>           <span class="token comment">// File type</span>
+  <span class="token keyword keyword-short">short</span> major<span class="token punctuation">;</span>          <span class="token comment">// Major device number (T_DEVICE only)</span>
+  <span class="token keyword keyword-short">short</span> minor<span class="token punctuation">;</span>          <span class="token comment">// Minor device number (T_DEVICE only)</span>
+  <span class="token keyword keyword-short">short</span> nlink<span class="token punctuation">;</span>          <span class="token comment">// Number of links to inode in file system</span>
+  uint size<span class="token punctuation">;</span>            <span class="token comment">// Size of file (bytes)</span>
+  uint addrs<span class="token punctuation">[</span>NDIRECT<span class="token operator">+</span><span class="token number">1</span><span class="token operator">+</span><span class="token number">1</span><span class="token punctuation">]</span><span class="token punctuation">;</span>   <span class="token comment">// Data block addresses</span>
+  <span class="token comment">// 再加一个用来当作二级表</span>
+<span class="token punctuation">}</span><span class="token punctuation">;</span>
+</code></pre><p>修改kernel/fs.c中的bmap函数和itrunc函数：</p>
+<pre data-role="codeBlock" data-info="c" class="language-c c"><code><span class="token keyword keyword-static">static</span> uint
+<span class="token function">bmap</span><span class="token punctuation">(</span><span class="token keyword keyword-struct">struct</span> <span class="token class-name">inode</span> <span class="token operator">*</span>ip<span class="token punctuation">,</span> uint bn<span class="token punctuation">)</span>
+<span class="token punctuation">{</span>
+  uint addr<span class="token punctuation">,</span> <span class="token operator">*</span>a<span class="token punctuation">;</span>
+  <span class="token keyword keyword-struct">struct</span> <span class="token class-name">buf</span> <span class="token operator">*</span>bp<span class="token punctuation">;</span>
+
+  <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span>bn <span class="token operator">&lt;</span> NDIRECT<span class="token punctuation">)</span><span class="token punctuation">{</span>
+    <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span><span class="token punctuation">(</span>addr <span class="token operator">=</span> ip<span class="token operator">-&gt;</span>addrs<span class="token punctuation">[</span>bn<span class="token punctuation">]</span><span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token number">0</span><span class="token punctuation">)</span>
+      ip<span class="token operator">-&gt;</span>addrs<span class="token punctuation">[</span>bn<span class="token punctuation">]</span> <span class="token operator">=</span> addr <span class="token operator">=</span> <span class="token function">balloc</span><span class="token punctuation">(</span>ip<span class="token operator">-&gt;</span>dev<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token keyword keyword-return">return</span> addr<span class="token punctuation">;</span>
+  <span class="token punctuation">}</span>
+  bn <span class="token operator">-=</span> NDIRECT<span class="token punctuation">;</span>
+
+  <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span>bn <span class="token operator">&lt;</span> NINDIRECT<span class="token punctuation">)</span><span class="token punctuation">{</span>
+    <span class="token comment">// Load indirect block, allocating if necessary.</span>
+    <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span><span class="token punctuation">(</span>addr <span class="token operator">=</span> ip<span class="token operator">-&gt;</span>addrs<span class="token punctuation">[</span>NDIRECT<span class="token punctuation">]</span><span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token number">0</span><span class="token punctuation">)</span>
+      ip<span class="token operator">-&gt;</span>addrs<span class="token punctuation">[</span>NDIRECT<span class="token punctuation">]</span> <span class="token operator">=</span> addr <span class="token operator">=</span> <span class="token function">balloc</span><span class="token punctuation">(</span>ip<span class="token operator">-&gt;</span>dev<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    bp <span class="token operator">=</span> <span class="token function">bread</span><span class="token punctuation">(</span>ip<span class="token operator">-&gt;</span>dev<span class="token punctuation">,</span> addr<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    a <span class="token operator">=</span> <span class="token punctuation">(</span>uint<span class="token operator">*</span><span class="token punctuation">)</span>bp<span class="token operator">-&gt;</span>data<span class="token punctuation">;</span>
+    <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span><span class="token punctuation">(</span>addr <span class="token operator">=</span> a<span class="token punctuation">[</span>bn<span class="token punctuation">]</span><span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">{</span>
+      a<span class="token punctuation">[</span>bn<span class="token punctuation">]</span> <span class="token operator">=</span> addr <span class="token operator">=</span> <span class="token function">balloc</span><span class="token punctuation">(</span>ip<span class="token operator">-&gt;</span>dev<span class="token punctuation">)</span><span class="token punctuation">;</span>
+      <span class="token function">log_write</span><span class="token punctuation">(</span>bp<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+    <span class="token function">brelse</span><span class="token punctuation">(</span>bp<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token keyword keyword-return">return</span> addr<span class="token punctuation">;</span>
+  <span class="token punctuation">}</span>
+
+  <span class="token comment">// 添加双间接索引</span>
+  bn <span class="token operator">-=</span> NINDIRECT<span class="token punctuation">;</span>
+  <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span>bn <span class="token operator">&lt;</span> NDBINDIRECT<span class="token punctuation">)</span><span class="token punctuation">{</span>
+    <span class="token comment">// 先查询一级表的地址</span>
+    <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span><span class="token punctuation">(</span>addr <span class="token operator">=</span> ip<span class="token operator">-&gt;</span>addrs<span class="token punctuation">[</span>NDIRECT<span class="token operator">+</span><span class="token number">1</span><span class="token punctuation">]</span><span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token number">0</span><span class="token punctuation">)</span>
+      ip<span class="token operator">-&gt;</span>addrs<span class="token punctuation">[</span>NDIRECT<span class="token operator">+</span><span class="token number">1</span><span class="token punctuation">]</span> <span class="token operator">=</span> addr <span class="token operator">=</span> <span class="token function">balloc</span><span class="token punctuation">(</span>ip<span class="token operator">-&gt;</span>dev<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+    bp <span class="token operator">=</span> <span class="token function">bread</span><span class="token punctuation">(</span>ip<span class="token operator">-&gt;</span>dev <span class="token punctuation">,</span> addr<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    a <span class="token operator">=</span> <span class="token punctuation">(</span>uint<span class="token operator">*</span><span class="token punctuation">)</span>bp<span class="token operator">-&gt;</span>data<span class="token punctuation">;</span>
+
+    <span class="token comment">// 获取两级索引</span>
+    uint first <span class="token operator">=</span> bn <span class="token operator">/</span> NINDIRECT<span class="token punctuation">;</span>
+    uint second <span class="token operator">=</span> bn <span class="token operator">%</span> NINDIRECT<span class="token punctuation">;</span>
+
+    <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span><span class="token punctuation">(</span>addr <span class="token operator">=</span> a<span class="token punctuation">[</span>first<span class="token punctuation">]</span><span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">{</span>
+      a<span class="token punctuation">[</span>first<span class="token punctuation">]</span> <span class="token operator">=</span> addr <span class="token operator">=</span> <span class="token function">balloc</span><span class="token punctuation">(</span>ip<span class="token operator">-&gt;</span>dev<span class="token punctuation">)</span><span class="token punctuation">;</span>
+      <span class="token function">log_write</span><span class="token punctuation">(</span>bp<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+    <span class="token function">brelse</span><span class="token punctuation">(</span>bp<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    
+    bp <span class="token operator">=</span> <span class="token function">bread</span><span class="token punctuation">(</span>ip<span class="token operator">-&gt;</span>dev<span class="token punctuation">,</span> addr<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    a <span class="token operator">=</span> <span class="token punctuation">(</span>uint<span class="token operator">*</span><span class="token punctuation">)</span>bp<span class="token operator">-&gt;</span>data<span class="token punctuation">;</span>
+
+    <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span><span class="token punctuation">(</span>addr <span class="token operator">=</span> a<span class="token punctuation">[</span>second<span class="token punctuation">]</span><span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">{</span>
+      a<span class="token punctuation">[</span>second<span class="token punctuation">]</span> <span class="token operator">=</span> addr <span class="token operator">=</span> <span class="token function">balloc</span><span class="token punctuation">(</span>ip<span class="token operator">-&gt;</span>dev<span class="token punctuation">)</span><span class="token punctuation">;</span>
+      <span class="token function">log_write</span><span class="token punctuation">(</span>bp<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+    <span class="token function">brelse</span><span class="token punctuation">(</span>bp<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token keyword keyword-return">return</span> addr<span class="token punctuation">;</span>
+  <span class="token punctuation">}</span>
+
+  <span class="token function">panic</span><span class="token punctuation">(</span><span class="token string">"bmap: out of range"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+
+<span class="token keyword keyword-void">void</span>
+<span class="token function">itrunc</span><span class="token punctuation">(</span><span class="token keyword keyword-struct">struct</span> <span class="token class-name">inode</span> <span class="token operator">*</span>ip<span class="token punctuation">)</span>
+<span class="token punctuation">{</span>
+  <span class="token keyword keyword-int">int</span> i<span class="token punctuation">,</span> j <span class="token punctuation">;</span>
+  <span class="token keyword keyword-struct">struct</span> <span class="token class-name">buf</span> <span class="token operator">*</span>bp<span class="token punctuation">;</span>
+  uint <span class="token operator">*</span>a<span class="token punctuation">;</span>
+
+  <span class="token keyword keyword-for">for</span><span class="token punctuation">(</span>i <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span> i <span class="token operator">&lt;</span> NDIRECT<span class="token punctuation">;</span> i<span class="token operator">++</span><span class="token punctuation">)</span><span class="token punctuation">{</span>
+    <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span>ip<span class="token operator">-&gt;</span>addrs<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token punctuation">{</span>
+      <span class="token function">bfree</span><span class="token punctuation">(</span>ip<span class="token operator">-&gt;</span>dev<span class="token punctuation">,</span> ip<span class="token operator">-&gt;</span>addrs<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+      ip<span class="token operator">-&gt;</span>addrs<span class="token punctuation">[</span>i<span class="token punctuation">]</span> <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+  <span class="token punctuation">}</span>
+
+  <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span>ip<span class="token operator">-&gt;</span>addrs<span class="token punctuation">[</span>NDIRECT<span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token punctuation">{</span>
+    bp <span class="token operator">=</span> <span class="token function">bread</span><span class="token punctuation">(</span>ip<span class="token operator">-&gt;</span>dev<span class="token punctuation">,</span> ip<span class="token operator">-&gt;</span>addrs<span class="token punctuation">[</span>NDIRECT<span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    a <span class="token operator">=</span> <span class="token punctuation">(</span>uint<span class="token operator">*</span><span class="token punctuation">)</span>bp<span class="token operator">-&gt;</span>data<span class="token punctuation">;</span>
+    <span class="token keyword keyword-for">for</span><span class="token punctuation">(</span>j <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span> j <span class="token operator">&lt;</span> NINDIRECT<span class="token punctuation">;</span> j<span class="token operator">++</span><span class="token punctuation">)</span><span class="token punctuation">{</span>
+      <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span>a<span class="token punctuation">[</span>j<span class="token punctuation">]</span><span class="token punctuation">)</span>
+        <span class="token function">bfree</span><span class="token punctuation">(</span>ip<span class="token operator">-&gt;</span>dev<span class="token punctuation">,</span> a<span class="token punctuation">[</span>j<span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+    <span class="token function">brelse</span><span class="token punctuation">(</span>bp<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token function">bfree</span><span class="token punctuation">(</span>ip<span class="token operator">-&gt;</span>dev<span class="token punctuation">,</span> ip<span class="token operator">-&gt;</span>addrs<span class="token punctuation">[</span>NDIRECT<span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    ip<span class="token operator">-&gt;</span>addrs<span class="token punctuation">[</span>NDIRECT<span class="token punctuation">]</span> <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span>
+  <span class="token punctuation">}</span>
+
+  <span class="token comment">// 仿照上面的代码，添加删除二级表的部分</span>
+  <span class="token keyword keyword-struct">struct</span> <span class="token class-name">buf</span> <span class="token operator">*</span>bp2 <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span>
+  uint <span class="token operator">*</span>b<span class="token punctuation">;</span>
+
+  <span class="token keyword keyword-if">if</span> <span class="token punctuation">(</span>ip<span class="token operator">-&gt;</span>addrs<span class="token punctuation">[</span>NDIRECT<span class="token operator">+</span><span class="token number">1</span><span class="token punctuation">]</span><span class="token punctuation">)</span> <span class="token punctuation">{</span>
+    bp <span class="token operator">=</span> <span class="token function">bread</span><span class="token punctuation">(</span>ip<span class="token operator">-&gt;</span>dev<span class="token punctuation">,</span> ip<span class="token operator">-&gt;</span>addrs<span class="token punctuation">[</span>NDIRECT<span class="token operator">+</span><span class="token number">1</span><span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    a <span class="token operator">=</span> <span class="token punctuation">(</span>uint<span class="token operator">*</span><span class="token punctuation">)</span>bp<span class="token operator">-&gt;</span>data<span class="token punctuation">;</span>
+    <span class="token keyword keyword-for">for</span> <span class="token punctuation">(</span>j <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span> j <span class="token operator">&lt;</span> NINDIRECT<span class="token punctuation">;</span> j<span class="token operator">++</span><span class="token punctuation">)</span> <span class="token punctuation">{</span>
+        <span class="token keyword keyword-if">if</span> <span class="token punctuation">(</span>a<span class="token punctuation">[</span>j<span class="token punctuation">]</span><span class="token punctuation">)</span> <span class="token punctuation">{</span>
+            bp2 <span class="token operator">=</span> <span class="token function">bread</span><span class="token punctuation">(</span>ip<span class="token operator">-&gt;</span>dev<span class="token punctuation">,</span> a<span class="token punctuation">[</span>j<span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            b <span class="token operator">=</span> <span class="token punctuation">(</span>uint<span class="token operator">*</span><span class="token punctuation">)</span>bp2<span class="token operator">-&gt;</span>data<span class="token punctuation">;</span>
+            <span class="token keyword keyword-for">for</span> <span class="token punctuation">(</span>i <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span> i <span class="token operator">&lt;</span> NINDIRECT<span class="token punctuation">;</span> i<span class="token operator">++</span><span class="token punctuation">)</span> <span class="token punctuation">{</span>
+                <span class="token keyword keyword-if">if</span> <span class="token punctuation">(</span>b<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">)</span> <span class="token punctuation">{</span>
+                    <span class="token function">bfree</span><span class="token punctuation">(</span>ip<span class="token operator">-&gt;</span>dev<span class="token punctuation">,</span> b<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                <span class="token punctuation">}</span>
+            <span class="token punctuation">}</span>
+            <span class="token function">brelse</span><span class="token punctuation">(</span>bp2<span class="token punctuation">)</span><span class="token punctuation">;</span>
+            <span class="token function">bfree</span><span class="token punctuation">(</span>ip<span class="token operator">-&gt;</span>dev<span class="token punctuation">,</span> a<span class="token punctuation">[</span>j<span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+            a<span class="token punctuation">[</span>j<span class="token punctuation">]</span> <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+    <span class="token punctuation">}</span>
+    <span class="token function">brelse</span><span class="token punctuation">(</span>bp<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token function">bfree</span><span class="token punctuation">(</span>ip<span class="token operator">-&gt;</span>dev<span class="token punctuation">,</span> ip<span class="token operator">-&gt;</span>addrs<span class="token punctuation">[</span>NDIRECT<span class="token operator">+</span><span class="token number">1</span><span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    ip<span class="token operator">-&gt;</span>addrs<span class="token punctuation">[</span>NDIRECT<span class="token operator">+</span><span class="token number">1</span><span class="token punctuation">]</span> <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+
+  ip<span class="token operator">-&gt;</span>size <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span>
+  <span class="token function">iupdate</span><span class="token punctuation">(</span>ip<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+</code></pre></details>
+<details>
+<summary>Symbolic links</summary>
+<p>在Makefie中添加：</p>
+<pre data-role="codeBlock" data-info="c" class="language-c c"><code>$U<span class="token operator">/</span>_symlinktest\
+</code></pre><p>在user/usys.pl和user/user.h中添加系统调用：</p>
+<pre data-role="codeBlock" data-info="c" class="language-c c"><code><span class="token comment">// usys.pl</span>
+<span class="token function">entry</span><span class="token punctuation">(</span><span class="token string">"symlink"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+<span class="token comment">// user.h</span>
+<span class="token keyword keyword-int">int</span> <span class="token function">symlink</span><span class="token punctuation">(</span><span class="token keyword keyword-char">char</span> <span class="token operator">*</span> <span class="token punctuation">,</span> <span class="token keyword keyword-char">char</span> <span class="token operator">*</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+</code></pre><p>在kernel/syscall.h和kernel/syscall.c中添加系统调用：</p>
+<pre data-role="codeBlock" data-info="c" class="language-c c"><code><span class="token comment">// syscall.h</span>
+<span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">define</span> <span class="token macro-name">SYS_symlink</span> <span class="token expression"><span class="token number">22</span></span></span>
+
+<span class="token comment">// syscall.c</span>
+<span class="token keyword keyword-extern">extern</span> uint64 <span class="token function">sys_symlink</span><span class="token punctuation">(</span><span class="token keyword keyword-void">void</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+<span class="token punctuation">[</span>SYS_symlink<span class="token punctuation">]</span> sys_symlink<span class="token punctuation">,</span>
+</code></pre><p>在kernel/stat.h中添加文件类型，在kernel/fcntl.h中添加标志位：</p>
+<pre data-role="codeBlock" data-info="c" class="language-c c"><code><span class="token comment">// stat.h</span>
+<span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">define</span> <span class="token macro-name">T_SYMLINK</span> <span class="token expression"><span class="token number">4</span>   </span><span class="token comment">// 符号连接</span></span>
+
+<span class="token comment">// fcntl.h</span>
+<span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">define</span> <span class="token macro-name">O_NOFOLLOW</span> <span class="token expression"><span class="token number">0x010</span></span></span>
+</code></pre><p>在kernel/sysfile.c中添加系统调用：</p>
+<pre data-role="codeBlock" data-info="c" class="language-c c"><code>uint64
+<span class="token function">sys_symlink</span><span class="token punctuation">(</span><span class="token keyword keyword-void">void</span><span class="token punctuation">)</span><span class="token punctuation">{</span>
+  <span class="token comment">// 符号链接指的是</span>
+  <span class="token comment">// path文件的内容指向另一个target文件</span>
+
+  <span class="token comment">// 这个函数需要实现的功能是</span>
+  <span class="token comment">// 为path新建一个inode</span>
+  <span class="token comment">// 其中的数据为target</span>
+
+  <span class="token keyword keyword-char">char</span> path<span class="token punctuation">[</span>MAXPATH<span class="token punctuation">]</span><span class="token punctuation">,</span> target<span class="token punctuation">[</span>MAXPATH<span class="token punctuation">]</span><span class="token punctuation">;</span>
+  <span class="token keyword keyword-struct">struct</span> <span class="token class-name">inode</span> <span class="token operator">*</span>ip<span class="token punctuation">;</span>
+
+  <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span><span class="token function">argstr</span><span class="token punctuation">(</span><span class="token number">0</span><span class="token punctuation">,</span> target<span class="token punctuation">,</span> MAXPATH<span class="token punctuation">)</span> <span class="token operator">&lt;</span> <span class="token number">0</span> <span class="token operator">||</span> <span class="token function">argstr</span><span class="token punctuation">(</span><span class="token number">1</span><span class="token punctuation">,</span> path<span class="token punctuation">,</span> MAXPATH<span class="token punctuation">)</span> <span class="token operator">&lt;</span> <span class="token number">0</span><span class="token punctuation">)</span>
+    <span class="token keyword keyword-return">return</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">;</span>
+
+  <span class="token comment">// 创建inode文件是原子操作，需要包裹在begin_op和end_op中</span>
+  <span class="token function">begin_op</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+  <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span><span class="token punctuation">(</span>ip <span class="token operator">=</span> <span class="token function">create</span><span class="token punctuation">(</span>path <span class="token punctuation">,</span> T_SYMLINK <span class="token punctuation">,</span> <span class="token number">0</span> <span class="token punctuation">,</span> <span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">{</span>
+    <span class="token comment">// 在create中已经对ip进行加锁</span>
+
+    <span class="token comment">// 创建一个路径为path的符号链接文件</span>
+    <span class="token function">end_op</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token keyword keyword-return">return</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">;</span>
+  <span class="token punctuation">}</span>
+
+  <span class="token comment">// 写入数据target</span>
+  <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span><span class="token function">writei</span><span class="token punctuation">(</span>ip <span class="token punctuation">,</span> <span class="token number">0</span> <span class="token punctuation">,</span> <span class="token punctuation">(</span>uint64<span class="token punctuation">)</span>target <span class="token punctuation">,</span> <span class="token number">0</span> <span class="token punctuation">,</span> MAXPATH<span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">{</span>
+    <span class="token comment">// 第三个参数是偏移量，从第0字节开始写</span>
+    <span class="token comment">// 第二个参数指示target在内核空间</span>
+
+    <span class="token comment">// 这里处理写入失败的情况，也就是需要返回-1</span>
+    <span class="token function">iunlockput</span><span class="token punctuation">(</span>ip<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token function">end_op</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token keyword keyword-return">return</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">;</span>
+  <span class="token punctuation">}</span>
+
+  <span class="token comment">// 完成操作后，要使用iunlockput表示提交ip这个inode</span>
+  <span class="token function">iunlockput</span><span class="token punctuation">(</span>ip<span class="token punctuation">)</span><span class="token punctuation">;</span>
+  <span class="token comment">// iunlockput表示既要解锁，也要减少引用数</span>
+  <span class="token comment">// 这里要减少引用计数，因为后续并不会再操作ip</span>
+  <span class="token comment">// 它的信息已经被写入了磁盘</span>
+  <span class="token function">end_op</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+  <span class="token keyword keyword-return">return</span> <span class="token number">0</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+</code></pre><p>在kernel/sysfile.c中改写系统调用open，由于在课程中较少提及这部分代码，在此处整体解释open系统调用：</p>
+<pre data-role="codeBlock" data-info="c" class="language-c c"><code>uint64
+<span class="token function">sys_open</span><span class="token punctuation">(</span><span class="token keyword keyword-void">void</span><span class="token punctuation">)</span>
+<span class="token punctuation">{</span>
+  <span class="token keyword keyword-char">char</span> path<span class="token punctuation">[</span>MAXPATH<span class="token punctuation">]</span><span class="token punctuation">;</span>
+  <span class="token keyword keyword-int">int</span> fd<span class="token punctuation">,</span> omode<span class="token punctuation">;</span>
+  <span class="token comment">// fd：最终返回的文件描述符；omode：打开模式（如只读、只写、创建等）</span>
+  <span class="token keyword keyword-struct">struct</span> <span class="token class-name">file</span> <span class="token operator">*</span>f<span class="token punctuation">;</span>
+  <span class="token keyword keyword-struct">struct</span> <span class="token class-name">inode</span> <span class="token operator">*</span>ip<span class="token punctuation">;</span>
+  <span class="token keyword keyword-int">int</span> n<span class="token punctuation">;</span>
+
+  <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span><span class="token punctuation">(</span>n <span class="token operator">=</span> <span class="token function">argstr</span><span class="token punctuation">(</span><span class="token number">0</span><span class="token punctuation">,</span> path<span class="token punctuation">,</span> MAXPATH<span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token operator">&lt;</span> <span class="token number">0</span> <span class="token operator">||</span> <span class="token function">argint</span><span class="token punctuation">(</span><span class="token number">1</span><span class="token punctuation">,</span> <span class="token operator">&amp;</span>omode<span class="token punctuation">)</span> <span class="token operator">&lt;</span> <span class="token number">0</span><span class="token punctuation">)</span>
+    <span class="token keyword keyword-return">return</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">;</span>
+
+  <span class="token function">begin_op</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+  <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span>omode <span class="token operator">&amp;</span> O_CREATE<span class="token punctuation">)</span><span class="token punctuation">{</span>
+    <span class="token comment">// 创建新文件，类型为普通文件（T_FILE）</span>
+    ip <span class="token operator">=</span> <span class="token function">create</span><span class="token punctuation">(</span>path<span class="token punctuation">,</span> T_FILE<span class="token punctuation">,</span> <span class="token number">0</span><span class="token punctuation">,</span> <span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span>ip <span class="token operator">==</span> <span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">{</span>
+      <span class="token function">end_op</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+      <span class="token keyword keyword-return">return</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+  <span class="token punctuation">}</span> <span class="token keyword keyword-else">else</span> <span class="token punctuation">{</span>
+    <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span><span class="token punctuation">(</span>ip <span class="token operator">=</span> <span class="token function">namei</span><span class="token punctuation">(</span>path<span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">{</span>
+      <span class="token comment">// 解析路径，查找已有文件的inode</span>
+      <span class="token comment">// 成功后，ip就是需要操作的文件的inode</span>
+
+      <span class="token function">end_op</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+      <span class="token keyword keyword-return">return</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+    <span class="token function">ilock</span><span class="token punctuation">(</span>ip<span class="token punctuation">)</span><span class="token punctuation">;</span><span class="token comment">// 要加锁保证并发安全</span>
+    
+    <span class="token comment">// 若文件是目录（T_DIR）且打开模式不是只读（O_RDONLY），则不允许操作</span>
+    <span class="token comment">// 相当于处理一个意外情况 </span>
+    <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span>ip<span class="token operator">-&gt;</span>type <span class="token operator">==</span> T_DIR <span class="token operator">&amp;&amp;</span> omode <span class="token operator">!=</span> O_RDONLY<span class="token punctuation">)</span><span class="token punctuation">{</span>
+      <span class="token function">iunlockput</span><span class="token punctuation">(</span>ip<span class="token punctuation">)</span><span class="token punctuation">;</span>
+      <span class="token function">end_op</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+      <span class="token keyword keyword-return">return</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+  <span class="token punctuation">}</span>
+
+  <span class="token keyword keyword-int">int</span> cnt <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span>
+  <span class="token keyword keyword-while">while</span><span class="token punctuation">(</span>ip<span class="token operator">-&gt;</span>type <span class="token operator">==</span> T_SYMLINK <span class="token operator">&amp;&amp;</span> <span class="token operator">!</span><span class="token punctuation">(</span>omode <span class="token operator">&amp;</span> O_NOFOLLOW<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">{</span>
+    cnt<span class="token operator">++</span><span class="token punctuation">;</span>
+    <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span>cnt <span class="token operator">&gt;</span> <span class="token number">10</span><span class="token punctuation">)</span><span class="token punctuation">{</span>
+      <span class="token comment">// 递归太深，打开失败</span>
+      <span class="token function">iunlockput</span><span class="token punctuation">(</span>ip<span class="token punctuation">)</span><span class="token punctuation">;</span>
+      <span class="token function">end_op</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+      <span class="token keyword keyword-return">return</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+
+    <span class="token comment">// 如果打开的是一个T_SYMLINK文件，需要追踪下去</span>
+
+    <span class="token comment">// 把ip中的data读取到path中</span>
+    <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span><span class="token function">readi</span><span class="token punctuation">(</span>ip <span class="token punctuation">,</span> <span class="token number">0</span> <span class="token punctuation">,</span> <span class="token punctuation">(</span>uint64<span class="token punctuation">)</span>path <span class="token punctuation">,</span> <span class="token number">0</span> <span class="token punctuation">,</span> MAXPATH<span class="token punctuation">)</span> <span class="token operator">&lt;</span> MAXPATH<span class="token punctuation">)</span><span class="token punctuation">{</span>
+      <span class="token comment">// 这里处理读取失败的情况</span>
+      <span class="token function">iunlockput</span><span class="token punctuation">(</span>ip<span class="token punctuation">)</span><span class="token punctuation">;</span>
+      <span class="token function">end_op</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+      <span class="token keyword keyword-return">return</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+
+    <span class="token comment">// 更新ip之前要释放掉锁</span>
+    <span class="token function">iunlockput</span><span class="token punctuation">(</span>ip<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+    <span class="token comment">// 获取新的名字为path的文件</span>
+    <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span><span class="token punctuation">(</span>ip <span class="token operator">=</span> <span class="token function">namei</span><span class="token punctuation">(</span>path<span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">{</span>
+      <span class="token comment">// 这里处理读取失败的情况</span>
+      <span class="token function">end_op</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+      <span class="token keyword keyword-return">return</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+    <span class="token function">ilock</span><span class="token punctuation">(</span>ip<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token comment">// 读取成功进入下一次寻找的话需要上锁</span>
+  <span class="token punctuation">}</span>
+
+  <span class="token comment">// 验证设备文件的合法性</span>
+  <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span>ip<span class="token operator">-&gt;</span>type <span class="token operator">==</span> T_DEVICE <span class="token operator">&amp;&amp;</span> <span class="token punctuation">(</span>ip<span class="token operator">-&gt;</span>major <span class="token operator">&lt;</span> <span class="token number">0</span> <span class="token operator">||</span> ip<span class="token operator">-&gt;</span>major <span class="token operator">&gt;=</span> NDEV<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">{</span>
+    <span class="token function">iunlockput</span><span class="token punctuation">(</span>ip<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token function">end_op</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token keyword keyword-return">return</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">;</span>
+  <span class="token punctuation">}</span>
+
+  <span class="token comment">// 分配file结构体和文件描述符</span>
+  <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span><span class="token punctuation">(</span>f <span class="token operator">=</span> <span class="token function">filealloc</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token number">0</span> <span class="token operator">||</span> <span class="token punctuation">(</span>fd <span class="token operator">=</span> <span class="token function">fdalloc</span><span class="token punctuation">(</span>f<span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token operator">&lt;</span> <span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">{</span>
+    <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span>f<span class="token punctuation">)</span>
+      <span class="token function">fileclose</span><span class="token punctuation">(</span>f<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token function">iunlockput</span><span class="token punctuation">(</span>ip<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token function">end_op</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token keyword keyword-return">return</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">;</span>
+  <span class="token punctuation">}</span>
+
+  <span class="token comment">// 初始化文件结构体</span>
+  <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span>ip<span class="token operator">-&gt;</span>type <span class="token operator">==</span> T_DEVICE<span class="token punctuation">)</span><span class="token punctuation">{</span>
+    f<span class="token operator">-&gt;</span>type <span class="token operator">=</span> FD_DEVICE<span class="token punctuation">;</span>
+    f<span class="token operator">-&gt;</span>major <span class="token operator">=</span> ip<span class="token operator">-&gt;</span>major<span class="token punctuation">;</span>
+  <span class="token punctuation">}</span> <span class="token keyword keyword-else">else</span> <span class="token punctuation">{</span>
+    f<span class="token operator">-&gt;</span>type <span class="token operator">=</span> FD_INODE<span class="token punctuation">;</span>
+    f<span class="token operator">-&gt;</span>off <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span>
+  <span class="token punctuation">}</span>
+  f<span class="token operator">-&gt;</span>ip <span class="token operator">=</span> ip<span class="token punctuation">;</span>
+  f<span class="token operator">-&gt;</span>readable <span class="token operator">=</span> <span class="token operator">!</span><span class="token punctuation">(</span>omode <span class="token operator">&amp;</span> O_WRONLY<span class="token punctuation">)</span><span class="token punctuation">;</span>
+  f<span class="token operator">-&gt;</span>writable <span class="token operator">=</span> <span class="token punctuation">(</span>omode <span class="token operator">&amp;</span> O_WRONLY<span class="token punctuation">)</span> <span class="token operator">||</span> <span class="token punctuation">(</span>omode <span class="token operator">&amp;</span> O_RDWR<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+  <span class="token comment">// 打开时清除文件</span>
+  <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span><span class="token punctuation">(</span>omode <span class="token operator">&amp;</span> O_TRUNC<span class="token punctuation">)</span> <span class="token operator">&amp;&amp;</span> ip<span class="token operator">-&gt;</span>type <span class="token operator">==</span> T_FILE<span class="token punctuation">)</span><span class="token punctuation">{</span>
+    <span class="token function">itrunc</span><span class="token punctuation">(</span>ip<span class="token punctuation">)</span><span class="token punctuation">;</span>
+  <span class="token punctuation">}</span>
+
+  <span class="token function">iunlock</span><span class="token punctuation">(</span>ip<span class="token punctuation">)</span><span class="token punctuation">;</span>
+  <span class="token comment">// 这里没有put,只是unlock，是因为后续还需要写入打开的这个文件</span>
+  <span class="token comment">// 只会put那些已经关闭了的文件</span>
+  <span class="token function">end_op</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+  <span class="token keyword keyword-return">return</span> fd<span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+</code></pre><p>需要说明的是，在自己的虚拟机上完成作业，能够在make qemu时通过测试，但是make grade会timeout；<br>
+增加时间限制可以通过测试</p>
+</details>
+<h1 id="lec14">LEC14 </h1>
+<h2 id="logging系统重点">logging系统重点 </h2>
+<p>两条规则需要明确：<br>
+（1）write ahead rule，现将操作写到log中，再进行更新；<br>
+（2）freeing rule，在log中的内容被更新到磁盘上之前，不能复用log空间；</p>
+<p>从实验中也可以感受出，这个过程非常的慢，慢的原因如下：<br>
+处理文件操作是串行的，得一个一个文件保存；<br>
+系统调用是同步的，需要等待所有写磁盘操作结束；<br>
+每个block写两次，一次在log中，一次在真实位置中；</p>
+<h2 id="ext3">ext3 </h2>
+<p>transaction：文件系统操作过程中的一个原子操作；<br>
+ext3可以跟踪处于不同阶段的transaction；</p>
+<p>在ext3中，每个transaction有一个序列号；<br>
+在ext3的log中，有如下内容：</p>
+<p>super block:log中第一个有效的起始位置（在log中的block编号）和序列号；<br>
+需要记录起始位置是因为，transaction被用完之后，并非super block紧接的那一个作为当前的起始点；<br>
+这里只记录初始位置是因为transaction是连续递增的；</p>
+<p>之后每个连续的一段是一个transaction，每个transaction包含了如下内容：<br>
+descriptor block，类似于xv6中的headr block，log数据对应的实际磁盘block的编号；<br>
+针对每一个block编号的更新数据；<br>
+commit block，表示结束；</p>
+<p>descriptor block 和commit block会以特定的32位数字开头，用以区分不同的block；</p>
+<p>ext3提供了异步系统调用，也就是说写完缓存之后，不会等到写入磁盘后才返回；<br>
+也就是说应用程序很快就从文件系统调用返回，同时文件系统会在后台并行完成系统调用所要求的写磁盘操作；<br>
+这里的问题在于，有可能程序返回了，但是实际上磁盘没写上；<br>
+对于很大一部分应用程序而言，其实问题并不大，比如说编译器没写完就crash了，但是源文件还在，所以丢失问题不大；<br>
+但是对于编辑器来说，就必须保证写入磁盘中再返回，因此需要特殊的系统调用fsync；</p>
+<p>第二个好处是提供了批量处理功能；<br>
+也就是系统调用并不会单独作为transaction，而是在一个窗口期内5s内的系统调用被打包在一起，作为一个大的transaction;<br>
+这么做减少了反复读写磁盘的损耗，同时也加大了在write absorption（也就是反复写磁盘，但是在内存中进行覆盖）的概率；</p>
+<p>同时，虽然只有1个transaction能够接受系统调用，但是多个不同状态commit或者被释放等可以并行地写磁盘；<br>
+同时，由于当前transaction包含了许多系统调用，这些系统调用之间是可以并行的，当然这里需要使用更细致的锁，而不是像xv6那样用一把大锁把整个cache锁起来；</p>
+<p>系统调用，是指一个小的原子操作单元，被开始和结束包裹起来；<br>
+只有当每个系统调用都被完成后，transaction才能被commit；</p>
+<h2 id="疑难解决-1">疑难解决 </h2>
+<p>假设T1(transaction)准备关闭，我们需要等待其中的系统调用都完成，并且阻止新的系统调用；<br>
+这个时候实际上损失了性能，因为新的系统调用被阻塞了；<br>
+为什么不能让下一个T2从这时就开始接受新的系统调用呢？</p>
+<p>假设这时T1中的A系统调用没结束，T2中的B系统调用已经开始，等待T1关闭时，A系统调用的结果可能被B影响了，但是此时系统crash了，T2还未关闭；<br>
+恢复系统后，T1完成了commit，因此T1的操作会同步到磁盘中，但是T2的操作不会，因此此时出现了已同步操作A受到未同步操作B影响的情况；</p>
+<h1 id="lec15">LEC15 </h1>
+<h2 id="虚拟内存">虚拟内存 </h2>
+<p>利用内核空间的page fault，对于内核系统可以进行丰富的优化，现在想把这些优化带到用户空间中；<br>
+我们需要以下机制来帮助完成这件事：</p>
+<p>trap让内核中的page fault传播到用户空间，然后再用户空间的handler进行处理，处理完毕之后正常回到内核；<br>
+Prot操作，降低PTE的权限；Unprot，提升PTE的权限；<br>
+查看内存页是否是dirty的；<br>
+map2，一段物理内存对应两份虚拟内存，并且两份虚拟内存有不同的权限；</p>
+<h2 id="相关系统调用">相关系统调用 </h2>
+<p>mmap系统调用完成的功能就是，把磁盘中的一段地址映射到内存中的一串地址上；<br>
+这个系统调用避免了麻烦的read/write操作，从而可以直接使用指针来完成对文件内容的读写；<br>
+此外，也可以用来映射匿名内存，这其实相当于之前所说的sbrk，也就是申请物理内存；</p>
+<p>munmap可以解除一段地址的映射关系；</p>
+<p>mprotect可以修改mmap映射的虚拟内存而对权限；</p>
+<p>sigaction，就是处理特定信号的办法。比如page fault的信号是segfault，那么遇到segfault之后会调用传入的handler进行处理；</p>
+<p>这些系统调用可以与之前的机制对应起来：<br>
+trap对应的是sigaction；<br>
+port对应的是mportect；<br>
+map2对应的是多次调用mmap；</p>
+<p>VMA ：管理连续虚拟地址的对象；<br>
+页表是按照页进行管理的，如果有相当长的内容，比如说100MB，它们的权限相同，来源相同（属于相同的文件），实际上并不需要以页为单位进行管理，而是可以打包到一起，作为一个VMA对象进行管理；</p>
+<h2 id="大型缓存表">大型缓存表 </h2>
+<p>假设我们需要知道函数f[i]在任意位置处的值，为了避免费时的函数计算，一个好的解决方案是将f[i]预计算后存起来，之后查表使用；<br>
+但是如果这个表的大小超过了物理内存，则需要通过其他方式实现资源节省；</p>
+<p>我们用虚拟内存中的一段连续地址保存这个函数表，但是现在它们并没有任何内容；<br>
+现在进行一次查找f[i]，直接查询表单，会导致page fault；<br>
+遇到这种情况我们先针对虚拟地址分配物理内存，然后计算出f[i]并放入对应的物理内存中，再恢复程序运行；</p>
+<p>这么做的好处在于下次计算f[i]可以直接查表找到，并且想要查询f[i+1]无需申请额外的物理页，而是可以放在和f[i]相同的物理页中；</p>
+<p>不过一直这样下去的话，终究会把物理内存占满，因此我们需要回收某些之前被占用的物理页；<br>
+实现这点，相当于对这些PTE权限进行修改，即prot操作；<br>
+此时如果再使用这些地址，将会再次得到page fault;</p>
+<h2 id="garbage-collector">Garbage Collector </h2>
+<p>GC指编程语言替程序员完成内存释放；</p>
+<p>GC需要解决的问题是，不断再from中创建对象，直到from满的时候，需要启动GC，把from里面有用的部分搬到to中去，再清空from；</p>
+<p>这里的有用部分，指的是一些类似于树状的结构，比如A-&gt;B,B-&gt;A这种，可能有循环，我们只记录了其中的根节点r-&gt;A，因为照理能够通过根节点找到所有有用的部分；</p>
+<p>拷贝的方法是，先把根节点指向的A从from拷贝到to，然后根节点指向to中的A'，即r-&gt;A';<br>
+此时在from中需要留一个forward指针，A-&gt;A'；<br>
+下一步，A'会保留A内部的指针，因此可以找到A'(A)-&gt;B；<br>
+检查B没有forward指针，证明还没有完成拷贝，因此将B拷贝到B'，并留下forward指针B-&gt;B';<br>
+下一步B'继承了B中的指针，B'(B)-&gt;A，但是A已经有forward指针，因此无需再移动；<br>
+至此，from被完整拷贝到to中；</p>
+<p>可能会好奇这有什么用，为什么不直接删掉；<br>
+实际上这样能使得释放的空间是完整的，解决了内存碎片化的问题；<br>
+假如原本内存上有连续的D1,D2,D3，D4四段，想要删掉D1,D3两段；<br>
+直接删除的话会导致可用的内存不连续，如果想要存入一段较长的内存会失败；<br>
+而按照以上算法，会把有用的D2,D4复制到to中连续的部分，剩余的可用部分都是连续的；</p>
+<p>以上的算法叫做copying GC，会遇到一个显著的问题就是，一次拷贝需要操作完所有对象，期间程序被暂停；<br>
+考虑每次把以上的大任务拆成小任务，使得程序在每一次小的拷贝任务过程中能够正常运行；<br>
+这种做法叫做Baker算法，流程如下：</p>
+<p>初始时，把r拷贝到to区中的r'，但是r'-&gt;A；<br>
+当程序索要内存时，此时to区中有指向from的A；<br>
+因此把A拷贝到A'，并且r'-&gt;A'，A'-&gt;B；<br>
+然后正常为程序分配内存；</p>
+<p>以后每次需要内存时，就把to区中指向from的对象拷贝过来；</p>
+<p>但是，程序在执行的过程中，并不知道from区域的B是什么时候被拷贝到to去的，如果在拷贝之后调用了from中的B会引发错误；<br>
+因此增加规则，约定程序访问的对象只能在to中；<br>
+如果还在from中，要紧急将其拷贝到to中去，并更新指向它的指针；<br>
+需要注意的是，应用程序访问的顺序实际上和GC拷贝的顺序是一致的，只不过GC根据应用程序的访问进行拷贝；</p>
+<p>当然，这会导致程序访问变慢，因为需要进行检查；<br>
+同时，在多核情况下，可能引发多个核一个进行GC的拷贝，一个进行访问时的拷贝，导致拷贝冲突；<br>
+为了避免冲突，需要加锁，但是加锁意味着性能的牺牲；</p>
+<h2 id="虚拟内存特性实现gc">虚拟内存特性实现GC </h2>
+<p>核心在于使用page fault来代替检查过程，具体流程如下：</p>
+<p>在to中在划分unscanned和scanned区域；<br>
+对于unscanned区域中的对象，它指向from，应用程序无权限访问；<br>
+对于scanned区域中的对象，它指向to，应用程序有权访问；<br>
+对于from区域中的对象，应用程序无权访问；</p>
+<p>假设R-&gt;A-&gt;B，初始时把R拷贝到unscanned中的R'；<br>
+此时应用程序想访问A，触发page fault；<br>
+页错误处理机制把A拷贝到unscanned，并把R'权限修改，也就是变成scanned；<br>
+注意此时由于A'-&gt;B，B还在from中，因此A'还是处于unscanned状态；</p>
+<p>这样的话，就不需要在软件层面去判断应用程序的访问处于哪里，而是交给硬件的page fault进行处理；</p>
+<p>有一个疑问在于，问什么应用程序没权限访问，但是GC却有权限拷贝和修改相同的对象？<br>
+这里实际上使用了map2技术，即应用程序和GC访问到相同对象（物理内存）的虚拟内存是不一样的；<br>
+从PTE的角度说，物理路径相同，但是标志位不同；<br>
+但是找到PTE存储的位置，也就是找到PTE所使用的虚拟地址是不同的；</p>
+<p>这种方法实际上避免了使用锁，因为硬件保证了这一点；<br>
+同一时间只有一个核可以操作页；</p>
+<h2 id="lab10--mmap">Lab10 : mmap </h2>
+<p>点击可以展开实验的具体代码实现：</p>
+<details>
+<summary>mmap</summary>
+<p>先完成一些基础的配置工作：</p>
+<pre data-role="codeBlock" data-info="c" class="language-c c"><code><span class="token comment">// Makefile</span>
+$U<span class="token operator">/</span>_mmaptest\
+
+<span class="token comment">// user/user.h</span>
+<span class="token keyword keyword-void">void</span> <span class="token operator">*</span><span class="token function">mmap</span><span class="token punctuation">(</span><span class="token keyword keyword-void">void</span> <span class="token operator">*</span>addr<span class="token punctuation">,</span> <span class="token keyword keyword-int">int</span> length<span class="token punctuation">,</span> <span class="token keyword keyword-int">int</span> prot<span class="token punctuation">,</span> <span class="token keyword keyword-int">int</span> flags<span class="token punctuation">,</span>
+           <span class="token keyword keyword-int">int</span> fd<span class="token punctuation">,</span> <span class="token keyword keyword-int">int</span> offset<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token keyword keyword-int">int</span> <span class="token function">munmap</span><span class="token punctuation">(</span><span class="token keyword keyword-void">void</span> <span class="token operator">*</span>addr <span class="token punctuation">,</span> <span class="token keyword keyword-int">int</span> length<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+<span class="token comment">// user/usys.pl</span>
+<span class="token function">entry</span><span class="token punctuation">(</span><span class="token string">"mmap"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token function">entry</span><span class="token punctuation">(</span><span class="token string">"munmap"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+<span class="token comment">// kernel/syscall.c</span>
+<span class="token keyword keyword-extern">extern</span> uint64 <span class="token function">sys_mmap</span><span class="token punctuation">(</span><span class="token keyword keyword-void">void</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token keyword keyword-extern">extern</span> uint64 <span class="token function">sys_munmap</span><span class="token punctuation">(</span><span class="token keyword keyword-void">void</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+<span class="token punctuation">[</span>SYS_mmap<span class="token punctuation">]</span>    sys_mmap<span class="token punctuation">,</span>
+<span class="token punctuation">[</span>SYS_munmap<span class="token punctuation">]</span>  sys_munmap<span class="token punctuation">,</span>
+
+<span class="token comment">// kernel/syscall.h</span>
+<span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">define</span> <span class="token macro-name">SYS_mmap</span>   <span class="token expression"><span class="token number">22</span></span></span>
+<span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">define</span> <span class="token macro-name">SYS_munmap</span> <span class="token expression"><span class="token number">23</span></span></span>
+</code></pre><p>接着完成VMA相关的注册：</p>
+<pre data-role="codeBlock" data-info="c" class="language-c c"><code><span class="token comment">// 注册VMA结构体</span>
+<span class="token keyword keyword-struct">struct</span> <span class="token class-name">vma</span><span class="token punctuation">{</span>
+  <span class="token keyword keyword-int">int</span> valid<span class="token punctuation">;</span>
+  uint64 addr<span class="token punctuation">;</span>
+  uint64 len<span class="token punctuation">;</span> <span class="token comment">// vma原本的大小</span>
+  <span class="token keyword keyword-int">int</span> prot<span class="token punctuation">;</span>
+  <span class="token keyword keyword-int">int</span> flags<span class="token punctuation">;</span>
+  <span class="token keyword keyword-struct">struct</span> <span class="token class-name">file</span> <span class="token operator">*</span>f<span class="token punctuation">;</span>
+  <span class="token keyword keyword-int">int</span> off<span class="token punctuation">;</span>
+  <span class="token keyword keyword-int">int</span> valid_len<span class="token punctuation">;</span>  <span class="token comment">// vma实际有效的大小</span>
+
+  <span class="token comment">// 也就是说vma部分删除时</span>
+  <span class="token comment">// 并没有进行实际的清除</span>
+  <span class="token comment">// 而是进行了偏移设置，并缩减有效长度</span>
+<span class="token punctuation">}</span><span class="token punctuation">;</span>
+
+<span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">define</span> <span class="token macro-name">MAXVMA</span> <span class="token expression"><span class="token number">16</span></span></span>
+
+<span class="token keyword keyword-struct">struct</span> <span class="token class-name">proc</span> <span class="token punctuation">{</span>
+  <span class="token keyword keyword-struct">struct</span> <span class="token class-name">vma</span> vma<span class="token punctuation">[</span>MAXVMA<span class="token punctuation">]</span><span class="token punctuation">;</span>
+  <span class="token comment">// ...</span>
+<span class="token punctuation">}</span>
+</code></pre><p>注意要恢复kernel/fcntl.h中的声明；<br>
+下一步完成kernel/sysfile.c中的sys_mmap：</p>
+<pre data-role="codeBlock" data-info="c" class="language-c c"><code>uint64
+<span class="token function">sys_mmap</span><span class="token punctuation">(</span><span class="token keyword keyword-void">void</span><span class="token punctuation">)</span>
+<span class="token punctuation">{</span>
+  <span class="token comment">// 为进程添加一个有效的VMA</span>
+  <span class="token comment">// 只进行映射，不实际分配物理页</span>
+  <span class="token comment">// 成功则返回虚拟地址</span>
+
+  <span class="token comment">// 先读入参数，参数分别为：addr length prot flags fd offset</span>
+  <span class="token comment">// 由于addr , offset 始终为0，因此无需读入</span>
+  <span class="token keyword keyword-int">int</span> length <span class="token punctuation">,</span> prot <span class="token punctuation">,</span> flags <span class="token punctuation">,</span> fd<span class="token punctuation">;</span>
+  <span class="token keyword keyword-struct">struct</span> <span class="token class-name">file</span> <span class="token operator">*</span>f<span class="token punctuation">;</span>
+  <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span><span class="token function">argint</span><span class="token punctuation">(</span><span class="token number">1</span> <span class="token punctuation">,</span> <span class="token operator">&amp;</span>length<span class="token punctuation">)</span> <span class="token operator">&lt;</span> <span class="token number">0</span> <span class="token operator">||</span> <span class="token function">argint</span><span class="token punctuation">(</span><span class="token number">2</span> <span class="token punctuation">,</span> <span class="token operator">&amp;</span>prot<span class="token punctuation">)</span> <span class="token operator">&lt;</span> <span class="token number">0</span> <span class="token operator">||</span> <span class="token function">argint</span><span class="token punctuation">(</span><span class="token number">3</span> <span class="token punctuation">,</span> <span class="token operator">&amp;</span>flags<span class="token punctuation">)</span> <span class="token operator">||</span> <span class="token function">argfd</span><span class="token punctuation">(</span><span class="token number">4</span> <span class="token punctuation">,</span> <span class="token operator">&amp;</span>fd <span class="token punctuation">,</span> <span class="token operator">&amp;</span>f<span class="token punctuation">)</span> <span class="token operator">&lt;</span> <span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">{</span>
+    <span class="token keyword keyword-return">return</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">;</span>
+  <span class="token punctuation">}</span>
+
+  <span class="token comment">// 判断特殊情况，文件只读，但是需要写回文件</span>
+  <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span><span class="token operator">!</span>f<span class="token operator">-&gt;</span>writable <span class="token operator">&amp;&amp;</span> <span class="token punctuation">(</span>prot <span class="token operator">&amp;</span> PROT_WRITE<span class="token punctuation">)</span> <span class="token operator">&amp;&amp;</span> <span class="token punctuation">(</span>flags <span class="token operator">&amp;</span> MAP_SHARED<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">{</span>
+    <span class="token keyword keyword-return">return</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">;</span>
+  <span class="token punctuation">}</span>
+
+  <span class="token comment">// 找到一个未使用的VMA，并为其完成映射</span>
+  <span class="token keyword keyword-struct">struct</span> <span class="token class-name">proc</span> <span class="token operator">*</span>p <span class="token operator">=</span> <span class="token function">myproc</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+  <span class="token keyword keyword-struct">struct</span> <span class="token class-name">vma</span> <span class="token operator">*</span>vma <span class="token operator">=</span> p<span class="token operator">-&gt;</span>vma<span class="token punctuation">;</span>
+
+  <span class="token keyword keyword-for">for</span><span class="token punctuation">(</span><span class="token keyword keyword-int">int</span> i <span class="token operator">=</span> <span class="token number">0</span> <span class="token punctuation">;</span> i <span class="token operator">&lt;</span> MAXVMA <span class="token punctuation">;</span> i<span class="token operator">++</span><span class="token punctuation">)</span><span class="token punctuation">{</span>
+    <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span>vma<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>valid <span class="token operator">==</span> <span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">{</span>
+      vma<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>addr <span class="token operator">=</span> p<span class="token operator">-&gt;</span>sz<span class="token punctuation">;</span> <span class="token comment">// 虚拟地址</span>
+      vma<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>f <span class="token operator">=</span> <span class="token function">filedup</span><span class="token punctuation">(</span>f<span class="token punctuation">)</span><span class="token punctuation">;</span> <span class="token comment">// 可以增加文件引用数</span>
+      vma<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>flags <span class="token operator">=</span> flags<span class="token punctuation">;</span>
+      vma<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>len <span class="token operator">=</span> <span class="token function">PGROUNDUP</span><span class="token punctuation">(</span>length<span class="token punctuation">)</span><span class="token punctuation">;</span> <span class="token comment">// 要上升到整页</span>
+      vma<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>off <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span>
+      vma<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>valid_len <span class="token operator">=</span> <span class="token function">PGROUNDUP</span><span class="token punctuation">(</span>length<span class="token punctuation">)</span><span class="token punctuation">;</span>
+      vma<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>valid <span class="token operator">=</span> <span class="token number">1</span><span class="token punctuation">;</span>
+      vma<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>prot <span class="token operator">=</span> prot<span class="token punctuation">;</span>
+      p<span class="token operator">-&gt;</span>sz <span class="token operator">+=</span> vma<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>len<span class="token punctuation">;</span> <span class="token comment">// 分配虚拟内存</span>
+      <span class="token keyword keyword-return">return</span> vma<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>addr<span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+  <span class="token punctuation">}</span>
+  <span class="token keyword keyword-return">return</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+</code></pre><p>接着完成kernel/trap.c中的页错误处理：</p>
+<pre data-role="codeBlock" data-info="c" class="language-c c"><code><span class="token comment">// 添加头文件，否则编译错误</span>
+<span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">include</span> <span class="token string">"sleeplock.h"</span></span>
+<span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">include</span> <span class="token string">"fs.h"</span></span>
+<span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">include</span> <span class="token string">"file.h"</span></span>
+
+<span class="token keyword keyword-struct">struct</span> <span class="token class-name">file</span><span class="token punctuation">;</span>
+
+<span class="token comment">// usertrap函数，之前lazy allocation的位置</span>
+<span class="token keyword keyword-else">else</span> <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span><span class="token punctuation">(</span><span class="token function">r_scause</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token number">13</span> <span class="token operator">||</span> <span class="token function">r_scause</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token number">15</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">{</span>
+  <span class="token comment">// 处理page fault</span>
+  uint64 va <span class="token operator">=</span> <span class="token function">r_stval</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+  <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span>va <span class="token operator">&lt;</span> p<span class="token operator">-&gt;</span>trapframe<span class="token operator">-&gt;</span>sp <span class="token operator">||</span> va <span class="token operator">&gt;=</span> p<span class="token operator">-&gt;</span>sz<span class="token punctuation">)</span><span class="token punctuation">{</span>
+    <span class="token comment">// 处理不合法的虚拟地址</span>
+    <span class="token function">exit</span><span class="token punctuation">(</span><span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+  <span class="token punctuation">}</span>
+
+  va <span class="token operator">=</span> <span class="token function">PGROUNDDOWN</span><span class="token punctuation">(</span>va<span class="token punctuation">)</span><span class="token punctuation">;</span>
+  <span class="token keyword keyword-struct">struct</span> <span class="token class-name">vma</span> <span class="token operator">*</span>vma <span class="token operator">=</span> p<span class="token operator">-&gt;</span>vma<span class="token punctuation">;</span>
+
+  <span class="token keyword keyword-for">for</span><span class="token punctuation">(</span><span class="token keyword keyword-int">int</span> i <span class="token operator">=</span> <span class="token number">0</span> <span class="token punctuation">;</span> i <span class="token operator">&lt;</span> MAXVMA <span class="token punctuation">;</span> i<span class="token operator">++</span><span class="token punctuation">)</span><span class="token punctuation">{</span>
+    <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span>vma<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>valid <span class="token operator">&amp;&amp;</span> va <span class="token operator">&gt;=</span> vma<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>addr <span class="token operator">+</span> vma<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>off <span class="token operator">&amp;&amp;</span> va <span class="token operator">&lt;</span> vma<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>addr <span class="token operator">+</span> vma<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>off <span class="token operator">+</span> vma<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>valid_len<span class="token punctuation">)</span><span class="token punctuation">{</span>
+      <span class="token comment">// 从偏置开始才是有效的</span>
+      <span class="token comment">// 找到对应的vma，并为其分配内存</span>
+
+      <span class="token keyword keyword-char">char</span> <span class="token operator">*</span>mem <span class="token operator">=</span> <span class="token function">kalloc</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+      <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span>mem <span class="token operator">==</span> <span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">{</span>
+        <span class="token function">exit</span><span class="token punctuation">(</span><span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+      <span class="token punctuation">}</span>
+      <span class="token function">memset</span><span class="token punctuation">(</span>mem <span class="token punctuation">,</span> <span class="token number">0</span> <span class="token punctuation">,</span> PGSIZE<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+      <span class="token comment">// 虚拟地址到物理内存的映射</span>
+      <span class="token comment">// 注意要正确传递标志位</span>
+      <span class="token keyword keyword-int">int</span> flags <span class="token operator">=</span> <span class="token punctuation">(</span>vma<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>prot <span class="token operator">&lt;&lt;</span> <span class="token number">1</span><span class="token punctuation">)</span> <span class="token operator">|</span> PTE_U<span class="token punctuation">;</span>
+      <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span><span class="token function">mappages</span><span class="token punctuation">(</span>p<span class="token operator">-&gt;</span>pagetable <span class="token punctuation">,</span> va <span class="token punctuation">,</span> PGSIZE <span class="token punctuation">,</span> <span class="token punctuation">(</span>uint64<span class="token punctuation">)</span>mem <span class="token punctuation">,</span> flags<span class="token punctuation">)</span> <span class="token operator">!=</span> <span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">{</span>
+        <span class="token function">kfree</span><span class="token punctuation">(</span>mem<span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token function">exit</span><span class="token punctuation">(</span><span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+      <span class="token punctuation">}</span>
+
+      <span class="token comment">// 把文件内容读进物理页中</span>
+      <span class="token comment">// 不过这里用的readi第二个参数为1</span>
+      <span class="token comment">// 表示使用的是虚拟地址，因为我们已经完成了映射</span>
+      <span class="token keyword keyword-int">int</span> off <span class="token operator">=</span> va <span class="token operator">-</span> vma<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>addr<span class="token punctuation">;</span>
+      <span class="token function">ilock</span><span class="token punctuation">(</span>vma<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>f<span class="token operator">-&gt;</span>ip<span class="token punctuation">)</span><span class="token punctuation">;</span>
+      <span class="token function">readi</span><span class="token punctuation">(</span>vma<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>f<span class="token operator">-&gt;</span>ip <span class="token punctuation">,</span> <span class="token number">1</span> <span class="token punctuation">,</span> va <span class="token punctuation">,</span> off <span class="token punctuation">,</span> PGSIZE<span class="token punctuation">)</span><span class="token punctuation">;</span>
+      <span class="token function">iunlock</span><span class="token punctuation">(</span>vma<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>f<span class="token operator">-&gt;</span>ip<span class="token punctuation">)</span><span class="token punctuation">;</span>
+      <span class="token keyword keyword-break">break</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+  <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+</code></pre><p>完成kernel/sysfile.c中的sys_munmap：</p>
+<pre data-role="codeBlock" data-info="c" class="language-c c"><code>uint64
+<span class="token function">sys_munmap</span><span class="token punctuation">(</span><span class="token keyword keyword-void">void</span><span class="token punctuation">)</span>
+<span class="token punctuation">{</span>
+  <span class="token comment">// 解除虚拟映射，成功则返回0，失败返回-1</span>
+
+  <span class="token comment">// 读取2个参数, addr , length</span>
+  uint64 addr<span class="token punctuation">;</span>
+  <span class="token keyword keyword-int">int</span> length<span class="token punctuation">;</span>
+  <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span><span class="token function">argaddr</span><span class="token punctuation">(</span><span class="token number">0</span> <span class="token punctuation">,</span> <span class="token operator">&amp;</span>addr<span class="token punctuation">)</span> <span class="token operator">&lt;</span> <span class="token number">0</span> <span class="token operator">||</span> <span class="token function">argint</span><span class="token punctuation">(</span><span class="token number">1</span> <span class="token punctuation">,</span> <span class="token operator">&amp;</span>length<span class="token punctuation">)</span> <span class="token operator">&lt;</span> <span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">{</span>
+    <span class="token keyword keyword-return">return</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">;</span>
+  <span class="token punctuation">}</span>
+
+  <span class="token keyword keyword-struct">struct</span> <span class="token class-name">proc</span> <span class="token operator">*</span>p <span class="token operator">=</span> <span class="token function">myproc</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+  <span class="token keyword keyword-struct">struct</span> <span class="token class-name">vma</span> <span class="token operator">*</span>vma <span class="token operator">=</span> p<span class="token operator">-&gt;</span>vma<span class="token punctuation">;</span>
+
+  <span class="token keyword keyword-int">int</span> close <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span> <span class="token comment">// 用于标记是否清空了所有页</span>
+  <span class="token keyword keyword-for">for</span><span class="token punctuation">(</span><span class="token keyword keyword-int">int</span> i <span class="token operator">=</span> <span class="token number">0</span> <span class="token punctuation">;</span> i <span class="token operator">&lt;</span> MAXVMA <span class="token punctuation">;</span> i<span class="token operator">++</span><span class="token punctuation">)</span><span class="token punctuation">{</span>
+    <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span>vma<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>valid <span class="token operator">&amp;&amp;</span> addr <span class="token operator">&gt;=</span> vma<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>addr <span class="token operator">&amp;&amp;</span> addr <span class="token operator">&lt;</span> vma<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>addr <span class="token operator">+</span> vma<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>len<span class="token punctuation">)</span><span class="token punctuation">{</span>
+      <span class="token comment">// 找到对应的VMA进行处理</span>
+      addr <span class="token operator">=</span> <span class="token function">PGROUNDDOWN</span><span class="token punctuation">(</span>addr<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+      <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span>addr <span class="token operator">==</span> vma<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>addr <span class="token operator">+</span> vma<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>off<span class="token punctuation">)</span><span class="token punctuation">{</span>
+        <span class="token comment">// 从头开始删除</span>
+        <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span>length <span class="token operator">&gt;=</span> vma<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>valid_len<span class="token punctuation">)</span><span class="token punctuation">{</span>
+          <span class="token comment">// 把整个vma[i]都删掉了</span>
+          vma<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>valid <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span>
+          length <span class="token operator">=</span> vma<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>valid_len<span class="token punctuation">;</span>
+          close <span class="token operator">=</span> <span class="token number">1</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span> <span class="token keyword keyword-else">else</span><span class="token punctuation">{</span>
+          <span class="token comment">// 没有完全删除的话</span>
+          <span class="token comment">// 删除的方式是增加偏移量</span>
+          <span class="token comment">// 因为总是从偏移位置开始才是有效的</span>
+
+          vma<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>off <span class="token operator">+=</span> length<span class="token punctuation">;</span>
+          vma<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>valid_len <span class="token operator">-=</span> length<span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+      <span class="token punctuation">}</span> <span class="token keyword keyword-else">else</span><span class="token punctuation">{</span>
+        <span class="token comment">// 从中间开始删除</span>
+        <span class="token comment">// 这里题目中要求了，从中间删就是要全部删掉</span>
+        <span class="token comment">// 并不会在中间打洞</span>
+        <span class="token comment">// 所以实际上只需要把有效长度，也就是尾端往回缩就行</span>
+        length <span class="token operator">=</span> vma<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>addr <span class="token operator">+</span> vma<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>off <span class="token operator">+</span> vma<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>valid_len <span class="token operator">-</span> addr<span class="token punctuation">;</span>
+        vma<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>valid_len <span class="token operator">-=</span> length<span class="token punctuation">;</span>
+      <span class="token punctuation">}</span>
+
+      <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span>vma<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>flags <span class="token operator">&amp;</span> MAP_SHARED<span class="token punctuation">)</span><span class="token punctuation">{</span>
+        <span class="token comment">// 这里不需要判断是否是dirty的，也是题目保证的</span>
+        <span class="token function">filewrite_off</span><span class="token punctuation">(</span>vma<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>f <span class="token punctuation">,</span> addr <span class="token punctuation">,</span> length <span class="token punctuation">,</span> addr <span class="token operator">-</span> vma<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>addr<span class="token punctuation">)</span><span class="token punctuation">;</span>
+      <span class="token punctuation">}</span>
+
+      <span class="token comment">// 解除映射</span>
+      <span class="token function">uvmunmap</span><span class="token punctuation">(</span>p<span class="token operator">-&gt;</span>pagetable <span class="token punctuation">,</span> addr <span class="token punctuation">,</span> <span class="token function">PGROUNDUP</span><span class="token punctuation">(</span>length<span class="token punctuation">)</span> <span class="token operator">/</span> PGSIZE <span class="token punctuation">,</span> <span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+      <span class="token comment">// 关闭文件</span>
+      <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span>close<span class="token punctuation">)</span>
+        <span class="token function">fileclose</span><span class="token punctuation">(</span>vma<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>f<span class="token punctuation">)</span><span class="token punctuation">;</span>
+      <span class="token keyword keyword-return">return</span> <span class="token number">0</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+  <span class="token punctuation">}</span>
+  <span class="token keyword keyword-return">return</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+</code></pre><p>以上过程需要辅助函数filewrite_off：</p>
+<pre data-role="codeBlock" data-info="c" class="language-c c"><code><span class="token comment">// kernel/file.c</span>
+<span class="token keyword keyword-int">int</span>
+<span class="token function">filewrite_off</span><span class="token punctuation">(</span><span class="token keyword keyword-struct">struct</span> <span class="token class-name">file</span> <span class="token operator">*</span>f<span class="token punctuation">,</span> uint64 addr<span class="token punctuation">,</span> <span class="token keyword keyword-int">int</span> n <span class="token punctuation">,</span> uint64 off<span class="token punctuation">)</span>
+<span class="token punctuation">{</span> 
+  <span class="token comment">// 照抄filewrite</span>
+
+  <span class="token comment">// 这里改成传入的off即可</span>
+      <span class="token keyword keyword-if">if</span> <span class="token punctuation">(</span><span class="token punctuation">(</span>r <span class="token operator">=</span> <span class="token function">writei</span><span class="token punctuation">(</span>f<span class="token operator">-&gt;</span>ip<span class="token punctuation">,</span> <span class="token number">1</span><span class="token punctuation">,</span> addr <span class="token operator">+</span> i<span class="token punctuation">,</span> off<span class="token punctuation">,</span> n1<span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token operator">&gt;</span> <span class="token number">0</span><span class="token punctuation">)</span>
+        off <span class="token operator">+=</span> r<span class="token punctuation">;</span>
+
+  <span class="token comment">// 照抄filewrite</span>
+<span class="token punctuation">}</span>
+
+<span class="token comment">// kernel/defs.h中完成注册</span>
+<span class="token keyword keyword-int">int</span>             <span class="token function">filewrite_off</span><span class="token punctuation">(</span><span class="token keyword keyword-struct">struct</span> <span class="token class-name">file</span><span class="token operator">*</span><span class="token punctuation">,</span> uint64<span class="token punctuation">,</span> <span class="token keyword keyword-int">int</span> n <span class="token punctuation">,</span> uint64 off<span class="token punctuation">)</span><span class="token punctuation">;</span>
+</code></pre><p>在kernel/proc.c中修改fork,exit函数：</p>
+<pre data-role="codeBlock" data-info="c" class="language-c c"><code><span class="token comment">// fork</span>
+<span class="token function">release</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>np<span class="token operator">-&gt;</span>lock<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+<span class="token keyword keyword-for">for</span><span class="token punctuation">(</span><span class="token keyword keyword-int">int</span> i <span class="token operator">=</span> <span class="token number">0</span> <span class="token punctuation">;</span> i <span class="token operator">&lt;</span> MAXVMA <span class="token punctuation">;</span> i<span class="token operator">++</span><span class="token punctuation">)</span><span class="token punctuation">{</span>
+  <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span>p<span class="token operator">-&gt;</span>vma<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>valid<span class="token punctuation">)</span><span class="token punctuation">{</span>
+    <span class="token function">filedup</span><span class="token punctuation">(</span>p<span class="token operator">-&gt;</span>vma<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>f<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    np<span class="token operator">-&gt;</span>vma<span class="token punctuation">[</span>i<span class="token punctuation">]</span> <span class="token operator">=</span> p<span class="token operator">-&gt;</span>vma<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">;</span>
+  <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+
+<span class="token keyword keyword-return">return</span> pid<span class="token punctuation">;</span>
+
+<span class="token comment">// exit</span>
+<span class="token function">release</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>original_parent<span class="token operator">-&gt;</span>lock<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+<span class="token keyword keyword-for">for</span><span class="token punctuation">(</span><span class="token keyword keyword-int">int</span> i <span class="token operator">=</span> <span class="token number">0</span> <span class="token punctuation">;</span> i <span class="token operator">&lt;</span> MAXVMA <span class="token punctuation">;</span> i<span class="token operator">++</span><span class="token punctuation">)</span><span class="token punctuation">{</span>
+  <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span>p<span class="token operator">-&gt;</span>vma<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>valid<span class="token punctuation">)</span>
+    <span class="token function">uvmunmap</span><span class="token punctuation">(</span>p<span class="token operator">-&gt;</span>pagetable <span class="token punctuation">,</span> p<span class="token operator">-&gt;</span>vma<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>addr <span class="token punctuation">,</span> p<span class="token operator">-&gt;</span>vma<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">.</span>len <span class="token operator">/</span> PGSIZE <span class="token punctuation">,</span> <span class="token number">1</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+
+<span class="token comment">// Jump into the scheduler, never to return.</span>
+<span class="token function">sched</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+</code></pre><p>处理一些报错的panic：</p>
+<pre data-role="codeBlock" data-info="c" class="language-c c"><code><span class="token comment">// kernel/vm.c</span>
+<span class="token comment">// uvmcopy</span>
+<span class="token keyword keyword-if">if</span><span class="token punctuation">(</span><span class="token punctuation">(</span><span class="token operator">*</span>pte <span class="token operator">&amp;</span> PTE_V<span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token number">0</span><span class="token punctuation">)</span>
+      <span class="token keyword keyword-continue">continue</span><span class="token punctuation">;</span>
+      <span class="token comment">// panic("uvmcopy: page not present");</span>
+
+<span class="token comment">// kernel/vm.c</span>
+<span class="token comment">// uvmunmap</span>
+    <span class="token comment">//if((*pte &amp; PTE_V) == 0)</span>
+     <span class="token comment">// panic("uvmunmap: not mapped");</span>
+
+<span class="token comment">// kernel/kalloc.c</span>
+<span class="token comment">// kfree</span>
+<span class="token keyword keyword-void">void</span>
+<span class="token function">kfree</span><span class="token punctuation">(</span><span class="token keyword keyword-void">void</span> <span class="token operator">*</span>pa<span class="token punctuation">)</span>
+<span class="token punctuation">{</span>
+  <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span>pa <span class="token operator">==</span> <span class="token number">0</span><span class="token punctuation">)</span> <span class="token keyword keyword-return">return</span><span class="token punctuation">;</span>
+  <span class="token comment">// ...</span>
+<span class="token punctuation">}</span>
+</code></pre></details>
+<h1 id="lec16">LEC16 </h1>
+<h2 id="微内核">微内核 </h2>
+<p>内核中，仅提供线程以及IPC作为消息传递的途经，其余部分全部在用户空间实现；</p>
+<p>由于内核足够小，因此便于优化设计；<br>
+同时在用户空间提供的各种功能更模块化，并不会因为某个bug导致整个内核崩溃；</p>
+<h2 id="l4">L4 </h2>
+<p>L4具有的抽象概念如下：<br>
+Task（类似于进程），线程，地址空间，IPC；<br>
+注意Task中可能有多个线程；</p>
+<p>L4具有的系统调用如下：<br>
+线程创建，在指定地址空间创建线程；<br>
+IPC传输系统调用；<br>
+Map系统调用，映射内存页到进程地址空间中；<br>
+将硬件控制寄存器映射到Task地址空间在；<br>
+将设备中断转换成IPC消息；<br>
+page fault处理，L4会把page fault转换成IPC消息发给指定Task进行处理；</p>
+<h2 id="ipc">IPC </h2>
+<p>buffer system：<br>
+一种简单的完成进程之间消息传递的方式是通过buffer实现；<br>
+想要传递消息，就把进程内存中的内容拷贝到buffer后返回；<br>
+目标进程会从buffer中接受消息，再写入自己的内存；</p>
+<p>这种传输称为异步传输，因为发送后立即返回；<br>
+如果一个进程想要既发送，又接受，则需要2个buffer；</p>
+<p>当然以上的流程非常慢，因为需要不停地切换用户空间和内核空间，切换页表等操作（对于单核CPU）；<br>
+考虑以下同步设计：</p>
+<p>发送消息之后，P1进入内核，但是不返回，而是等待P2通过接受消息的系统调用进入内核；<br>
+当P1和P2都在内核中时，内核可以直接从P1用户空间拷贝到P2用户空间；<br>
+如果说发送消息短到可以放在寄存器中，只要把待发送消息存在寄存器里，之间从P1跳转到P2进程，再读取寄存器就可以知道信息的传输；<br>
+对于长的消息，可以将对应的物理页重映射到P2中，因此只需修改P2的页表即可；</p>
+<p>对于既要发送回复又要等待消息的进程，可以使用sendrecv系统调用，发送完后就在内核中等待，无需返回到用户空间后再次进入内核，节省了一半的切换；</p>
+<h2 id="微内核上的操作系统">微内核上的操作系统 </h2>
+<p>考虑在L4上运行Linux:<br>
+此时可以认为Linux内核时一个Task，而Linux的N个进程是N个Task；</p>
+<p>Linux本身的系统调用被修改成了将系统调用转换成IPC发送给Linux kernel Task进行处理；</p>
+<p>需要注意的是页表管理功能是L4内核提供的，因此Linux kernel中的修改页表部分需要交给L4内核进行处理；</p>
+<p>当优化做的足够好时，L4上的Linux并不会比原生Linux慢太多；</p>
+<h1 id="lec17">LEC17 </h1>
+<h2 id="虚拟机">虚拟机 </h2>
+<p>在硬件之上，有一个Host空间，其中运行了VMM；<br>
+VMM提供的是对于计算机的模拟；</p>
+<p>在Host空间之上，是Guest空间，其中运行了操作系统的内核；<br>
+对于Guest空间的操作系统而言，并不能够区分自己是运行在实际硬件上还是在VMM上的；</p>
+<p>虚拟机的好处：<br>
+在一个计算机上运行多个独立的操作系统；<br>
+低强度的服务以虚拟机形式运行节省物理机；<br>
+云计算中出借服务器；<br>
+便于开发调试内核；</p>
+<h2 id="构建vmm">构建VMM </h2>
+<p>最简单直接的构建VMM的方式就是直接解析每一条Guest指令，然后再转换成机器指令；<br>
+不过这么做比直接运行在真实计算机上慢得多；</p>
+<p>另一种方式是把Guest指令写到内存上，然后让CPU运行；<br>
+但是这其实有问题，因为Guest中的内核空间实际上在真实计算机中处于用户空间，无权进行一些内核模式下的操作；<br>
+如果强行让虚拟机运行到真实机器的内核中，会引发崩溃，因为可随意篡改不属于这个虚拟机的地址，并可能从中逃逸；</p>
+<p>解决方式是让可信赖的VMM处于管理模式，不可信赖的Guest空间操作系统处于用户模式；<br>
+一旦触发trap，会进入VMM中进行检查，为合理的请求执行管理模式权限下的操作；</p>
+<p>这里指的trap是虚拟机内核需要进行宿主机中内核才有权限的操作，比如读写特定寄存器；<br>
+VMM为虚拟机维护了虚拟的特定寄存器，使得虚拟机内核使用的特定寄存器实际上是VMM为其专门维护的；<br>
+因此VMM需要为每个虚拟机保存管理模式控制寄存器；</p>
+<p>对于页表而言，会更复杂一些；<br>
+虚拟机不能直接访问宿主机的物理内存；<br>
+而是有一个虚拟机以为的物理内存，这实际上是由VMM提供给他的；<br>
+因此VMM本身还会维护一个虚拟机物理地址和宿主机物理地址之间的映射关系；</p>
+<p>如果虚拟机需要访问硬件设备，它会访问硬件控制寄存器映射到内核地址空间的某个地址；<br>
+但是VMM并不会为这些内存地址分配物理页，因此一旦虚拟机访问这些地址，会触发trap；<br>
+VMM会查看指令知道虚拟机想访问硬件设备，因此会模拟硬件的接口与虚拟机进行交互；<br>
+这么做保证了虚拟机无法知道自己实际上并没有运行在物理机器上；</p>
+<p>如果虚拟机知道自己是虚拟机，可以改写一些设备驱动，使得它们和VMM提供的虚拟设备进行交互，从而避免频繁进入trap导致性能损失；</p>
+<p>对于一些特殊设备，比如网卡，它可以模拟出虚拟网卡的效果，从而VMM可以将这些虚拟网卡绑定到对应的虚拟机上使得虚拟机能够直接访问由VMM分配的虚拟网卡；</p>
+<h2 id="硬件支持">硬件支持 </h2>
+<p>硬件层面提供支持可以更方便地实现虚拟机；<br>
+VT-x机制就是在硬件中维护虚拟机的虚拟状态；<br>
+也就是说不需要之前所说的VMM的信息转手；<br>
+而是直接让虚拟机访问硬件中的寄存器副本；<br>
+同时硬件还可以自动支持虚拟机虚拟地址到虚拟机物理地址，以及虚拟机物理地址到宿主机物理地址的地址转换；<br>
+同时每个核拥有独立的VT-x，因此可以同时运行不同的虚拟机；</p>
+<p>也可以把硬件提供的这种对于虚拟机的隔离，用于操作系统的进程之上；<br>
+也就是说让不同进程像不同的虚拟机一样，用各自的寄存器副本处理问题；<br>
+同时，主进程相当于之前的VMM，可以运行信任程度较高的代码；<br>
+对于信任程度较低的代码可以交给硬件提供的虚拟机来运行；</p>
+<h1 id="lec18">LEC18 </h1>
+<h2 id="操作系统语言">操作系统语言 </h2>
+<p>C语言：<br>
+直接访问内存，无隐藏代码，接近在硬件上运行，控制内存分配和释放；<br>
+数组越界bug，释放后使用内存，共享内存释放；</p>
+<p>高级编程语言：<br>
+不允许数组越界，GC实现自动内存管理，面向对象语法；<br>
+性能更差，不能直接访问内存，不能集成汇编；</p>
+<h1 id="lec19">LEC19 </h1>
+<h2 id="计算机网络">计算机网络 </h2>
+<p>局域网LAN：少部分主机之间相互通信；<br>
+在局域网之上，由路由器Router连接了多个局域网；<br>
+通过路由器的转发，可以从一个局域网上的主机寻址到另一个局域网上的主机；</p>
+<p>局域网通信使用以太网协议；<br>
+长距离网络通信使用Internet Protocol协议；</p>
+<h2 id="以太网">以太网 </h2>
+<p>局域网中两个主机通信使用以太网协议；<br>
+主机通过以太网发送信息Frame，其中需要放入足够信息让各个主机之间互相识别；<br>
+因此Frame中先有一个Header，之后才是传输的Payload数据；<br>
+Header中有3个信息：目的以太网地址，源以太网地址、packet类型；</p>
+<p>以太网地址是48bit的数字，唯一识别一个网卡；<br>
+前24位是制造商，后24位是制造商给的编号；</p>
+<p>packet类型是一个16位数字，指示了如何处理packet；</p>
+<p>实际整个packet还有一些头和尾的标志，它们对于软件不可见，而是由硬件识别packet的起始和结束；</p>
+<p>tcpdump可以查看以太网packet；<br>
+输出信息包括接收packet时间，可读packet数据，以及收到packet的16进制数；</p>
+<p>0xffffffffffff表示广播地址，即packet需要发送给局域网中所有主机；</p>
+<h2 id="arp">ARP </h2>
+<p>IP地址：能够在互联网上找到目的地在哪，32bit；<br>
+路由器检查IP地址的高bit位，决定将packet发送到哪个互联网上的路由器；<br>
+到达了局域以太网之后，需要从32bit的IP地址找到对应主机的48bit以太网地址，这个协议叫做ARP；</p>
+<p>当一个packet到达路由器并需要转发给同一个以太网中的另一个主机时，会先在局域网中广播一个ARP packet；<br>
+这个ARP packet的作用是通知拥有这个32bit的IP地址的主机，把自己的48bit以太网地址返回；</p>
+<p>可以通过tcpdump来查看发送的packet信息：<br>
+<img src="..\assets\images\6.s081\image-19.png" alt="alt text"><br>
+第一条信息相当于说，拥有IP地址10.0.2.15的请回复给10.0.2.2；<br>
+第二条信息是意识到自己拥有10.0.2.15的主机发送的，告诉其以太网地址在52:54:00:12:34:56。</p>
+<p>需要注意网络协议是嵌套的；<br>
+首先有以太网header和以太网payload，在以太网payload中可以放入ARPheader，当然ARP并没有header；<br>
+如果有的话，比如是一个IP packet，其中又包含了下一个UDP packet；<br>
+在解析时，会一层一层剥掉header，最终读到想要的数据。</p>
+<h2 id="internet">Internet </h2>
+<p>IP协议比ARP协议更通用，能向互联网任意位置发送packet；<br>
+在发送的过程中，IP header会一直保留，但是在IP header之外的以太网headr一旦离开本地的以太网之后就会被剥离；</p>
+<p>IP header具有全局意义，因此需要包含足够的信息：<br>
+目的IP地址，源IP地址，协议；<br>
+协议中包含了校验检查，以及告诉目的主机应该用什么方式处理该packet；</p>
+<h2 id="udp">UDP </h2>
+<p>IP header能够让packet传输到互联网上的任意一个主机，但是我们想要更精确地知道需要让packet传到主机上的某一个应用程序；<br>
+TCP协议可以完成该工作，并且包含了检测丢包并重传的功能；</p>
+<p>UDP协议更为简单，会尽力而为地将packet发送到目的主机；<br>
+UDP header中包含的最关键字段是spot源端口和dport目的端口；<br>
+应用程序需要发送或接收packet，需要使用socket API，表明了其对特定端口的packet感兴趣；<br>
+因此操作系统会为其返回文件描述符，方主机收到一个目的端口匹配的packet，这个packet会出现在文件描述符中，之后应用程序可以通过文件描述符读取packet；</p>
+<h2 id="网络协议栈">网络协议栈 </h2>
+<p>socket layer是内核中的一层软件，它会维护如下信息：<br>
+一个表单，记录文件描述符和UDP/TCP端口号之间的关系；<br>
+每个socket有一个队列来储存接收到的packet；</p>
+<p>socket的上层就是需要用到网络服务的用户程序；<br>
+而在socket之下，分别是UDP/TCP层；IP/ARP层；以太网层；硬件层；</p>
+<p>当接收packet时，从下至上一层层剥离header；<br>
+当发送packet时，从上至下一层层添加header；</p>
+<h2 id="网卡">网卡 </h2>
+<p>网卡的内存通常较小，因此需要尽快把packet拷贝到计算机内存中；</p>
+<p>当packet到达时，网卡会把packet存在自己的缓存中，冰箱主机发送中断；<br>
+主机的驱动包含了一个循环，与网卡交互，询问当前是否缓存了packet；<br>
+如果是的话，主机的循环会逐字节的拷贝packet到主机的内存中，再将内存中的packet加到队列中；</p>
+<p>实验中用到的是E1000网卡的结构，内部没有太多缓存；<br>
+因此网卡会直接把packet拷贝到主机的内存中；<br>
+内存中的packet会等待驱动来读取自己；<br>
+因此网卡需要知道要把packet拷贝到主机内存中的位置；<br>
+主机的软件会格式化好DMA ring，ring里面存的就是packet指针；</p>
+<p>驱动初始化网卡时，会分配比如16个1500字节长度的packet buffer，同时准备一个16个指针的数组；<br>
+用到了最后一个buffer之后，会返回使用第一个buffer；</p>
+<p>对于发送和接收，各自有自己的buffer；</p>
+<h2 id="livelock">Livelock </h2>
+<p>考虑路由器接收并转发packet；<br>
+可以预见，转发packet的速度不会随着接收packet的速度一路上升，因为CPU的处理新能有限；<br>
+但是我们预期到达一定限度之后，转发速度会固定在某一位置，然而实际情况是，转发速度反而会下降：<br>
+<img src="..\assets\images\6.s081\image-20.png" alt="alt text"></p>
+<p>这种现象称为Livelock；<br>
+其原因在于，每个收到的packet都会生成一个中断；<br>
+而中断处理涉及到CPU将packet从网卡拷贝到主机的内存中，代价很高昂；<br>
+因此越来越多的CPU时间被用来处理中断，而不是进行转发packet；<br>
+总之，核心在于中断处理任务太重，且频率太高；<br>
+因此解决问题的核心在于，减少中断处理任务量以及触发频率；</p>
+<p>解决方案是，有一个专门的线程，可以打开和关闭中断并进行处理；<br>
+当网卡第一次触发中断时，中断函数并不从网卡拷贝packet；<br>
+而是唤醒处理线程，并关闭网卡中断，然后拉取一些packet进行处理；<br>
+如果网卡中没有等待处理的packet，就会把处理线程切换到sleep，并打开中断；<br>
+此时中断只进行唤醒处理线程和关闭中断两件事，并且可以一次处理多个packet，减少触发频率；</p>
+<h2 id="lab11--networking">Lab11 ： networking </h2>
+<p>点击即可展开以下实验的具体代码实现：</p>
+<details>
+<summary>network</summary>
+<p>在kernel/defs.h开头添加定义：</p>
+<pre data-role="codeBlock" data-info="c" class="language-c c"><code><span class="token macro property"><span class="token directive-hash">#</span><span class="token directive keyword">define</span> <span class="token macro-name">LAB_NET</span> <span class="token expression"><span class="token number">1</span></span></span>
+</code></pre><p>在kernel/e1000.c中完成以下函数：</p>
+<pre data-role="codeBlock" data-info="c" class="language-c c"><code><span class="token keyword keyword-int">int</span>
+<span class="token function">e1000_transmit</span><span class="token punctuation">(</span><span class="token keyword keyword-struct">struct</span> <span class="token class-name">mbuf</span> <span class="token operator">*</span>m<span class="token punctuation">)</span>
+<span class="token punctuation">{</span>
+  <span class="token comment">// printf("hello transmit");</span>
+  <span class="token comment">// 根据提示，需要锁进行保护</span>
+  <span class="token function">acquire</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>e1000_lock<span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+  <span class="token comment">// 获取索引并检查</span>
+  uint32 index <span class="token operator">=</span> regs<span class="token punctuation">[</span>E1000_TDT<span class="token punctuation">]</span><span class="token punctuation">;</span>
+  <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span><span class="token punctuation">(</span>tx_ring<span class="token punctuation">[</span>index<span class="token punctuation">]</span><span class="token punctuation">.</span>status <span class="token operator">&amp;</span> E1000_TXD_STAT_DD<span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">{</span>
+    <span class="token function">release</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>e1000_lock<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token keyword keyword-return">return</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">;</span>
+  <span class="token punctuation">}</span>
+
+  <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span>tx_mbufs<span class="token punctuation">[</span>index<span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token punctuation">{</span>
+    <span class="token comment">// 释放上一次发送使用的mbuf</span>
+    <span class="token function">mbuffree</span><span class="token punctuation">(</span>tx_mbufs<span class="token punctuation">[</span>index<span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+  <span class="token punctuation">}</span>
+
+  <span class="token comment">// 存mbuf指针，便于后续释放</span>
+  tx_mbufs<span class="token punctuation">[</span>index<span class="token punctuation">]</span> <span class="token operator">=</span> m<span class="token punctuation">;</span>
+
+  <span class="token comment">// 填充tx_ring</span>
+  tx_ring<span class="token punctuation">[</span>index<span class="token punctuation">]</span><span class="token punctuation">.</span>addr <span class="token operator">=</span> <span class="token punctuation">(</span>uint64<span class="token punctuation">)</span>m<span class="token operator">-&gt;</span>head<span class="token punctuation">;</span>
+  tx_ring<span class="token punctuation">[</span>index<span class="token punctuation">]</span><span class="token punctuation">.</span>length <span class="token operator">=</span> <span class="token punctuation">(</span>uint16<span class="token punctuation">)</span>m<span class="token operator">-&gt;</span>len<span class="token punctuation">;</span>
+  tx_ring<span class="token punctuation">[</span>index<span class="token punctuation">]</span><span class="token punctuation">.</span>cmd <span class="token operator">=</span> E1000_TXD_CMD_EOP <span class="token operator">|</span> E1000_TXD_CMD_RS<span class="token punctuation">;</span>
+
+  <span class="token comment">// 更新发送环位置</span>
+  regs<span class="token punctuation">[</span>E1000_TDT<span class="token punctuation">]</span> <span class="token operator">=</span> <span class="token punctuation">(</span>index <span class="token operator">+</span> <span class="token number">1</span><span class="token punctuation">)</span> <span class="token operator">%</span> TX_RING_SIZE<span class="token punctuation">;</span>
+
+  <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span>tx_mbufs<span class="token punctuation">[</span>index<span class="token punctuation">]</span> <span class="token operator">==</span> <span class="token number">0</span> <span class="token operator">||</span> <span class="token operator">&amp;</span>tx_ring<span class="token punctuation">[</span>index<span class="token punctuation">]</span> <span class="token operator">==</span> <span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">{</span>
+    <span class="token comment">// 处理没有发送成功的情况</span>
+    <span class="token function">release</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>e1000_lock<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token keyword keyword-return">return</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">;</span>
+  <span class="token punctuation">}</span>
+
+  <span class="token function">release</span><span class="token punctuation">(</span><span class="token operator">&amp;</span>e1000_lock<span class="token punctuation">)</span><span class="token punctuation">;</span>
+  
+  <span class="token keyword keyword-return">return</span> <span class="token number">0</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+
+<span class="token keyword keyword-static">static</span> <span class="token keyword keyword-void">void</span>
+<span class="token function">e1000_recv</span><span class="token punctuation">(</span><span class="token keyword keyword-void">void</span><span class="token punctuation">)</span>
+<span class="token punctuation">{</span>
+  <span class="token comment">// printf("hello recv");</span>
+
+  <span class="token comment">// 这里不需要lock</span>
+  <span class="token comment">// 因为recv属于中断处理，本身是串行的</span>
+
+  <span class="token keyword keyword-while">while</span><span class="token punctuation">(</span><span class="token number">1</span><span class="token punctuation">)</span><span class="token punctuation">{</span>
+    <span class="token comment">// 不停地接收</span>
+    uint32 index <span class="token operator">=</span> <span class="token punctuation">(</span>regs<span class="token punctuation">[</span>E1000_RDT<span class="token punctuation">]</span> <span class="token operator">+</span> <span class="token number">1</span><span class="token punctuation">)</span> <span class="token operator">%</span> TX_RING_SIZE<span class="token punctuation">;</span>
+
+    <span class="token comment">// 检查有无新数据包</span>
+    <span class="token keyword keyword-if">if</span><span class="token punctuation">(</span><span class="token punctuation">(</span>rx_ring<span class="token punctuation">[</span>index<span class="token punctuation">]</span><span class="token punctuation">.</span>status <span class="token operator">&amp;</span> E1000_RXD_STAT_DD<span class="token punctuation">)</span> <span class="token operator">==</span> <span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">{</span>
+      <span class="token keyword keyword-return">return</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+
+    <span class="token comment">// 更新长度，传递mbuf</span>
+    rx_mbufs<span class="token punctuation">[</span>index<span class="token punctuation">]</span><span class="token operator">-&gt;</span>len <span class="token operator">=</span> rx_ring<span class="token punctuation">[</span>index<span class="token punctuation">]</span><span class="token punctuation">.</span>length<span class="token punctuation">;</span>
+    <span class="token function">net_rx</span><span class="token punctuation">(</span>rx_mbufs<span class="token punctuation">[</span>index<span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+    <span class="token comment">// 分配新的mbuf并写入描述符</span>
+    <span class="token keyword keyword-struct">struct</span> <span class="token class-name">mbuf</span> <span class="token operator">*</span>m <span class="token operator">=</span> <span class="token function">mbufalloc</span><span class="token punctuation">(</span><span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    rx_mbufs<span class="token punctuation">[</span>index<span class="token punctuation">]</span> <span class="token operator">=</span> m<span class="token punctuation">;</span>
+    rx_ring<span class="token punctuation">[</span>index<span class="token punctuation">]</span><span class="token punctuation">.</span>addr <span class="token operator">=</span> <span class="token punctuation">(</span>uint64<span class="token punctuation">)</span>m<span class="token operator">-&gt;</span>head<span class="token punctuation">;</span>
+    rx_ring<span class="token punctuation">[</span>index<span class="token punctuation">]</span><span class="token punctuation">.</span>status <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span>
+
+    regs<span class="token punctuation">[</span>E1000_RDT<span class="token punctuation">]</span> <span class="token operator">=</span> index<span class="token punctuation">;</span>
+  <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+</code></pre></details>
 
       </div>
       
